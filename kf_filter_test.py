@@ -151,3 +151,119 @@ def send_velocity(vehicle: Vehicle, logger: logging.Logger, vx, vy, vz):
     vehicle.flush()
     logger.debug(f"Sending velocity: VX={vx:.4f}, VY={vy:.4f} VZ={vz:.4f}. alt={vehicle.location.global_relative_frame.alt}")
 
+def send_velocity_to_unity(sock: socket.socket, vx: float, vy: float, vz: float):
+    """Send velocity commands to Unity drone controller"""
+    try:
+        # Note: Unity might use different coordinate system
+        # Adjust signs if needed based on your Unity setup
+        command = f"VEL:{vx:.4f},{vy:.4f},{vz:.4f}\n"
+        sock.sendall(command.encode())
+    except Exception as e:
+        print(f">>> ERROR sending velocity to Unity: {e}")
+        
+def yaw_to_angle(vehicle: Vehicle, logger: logging.Logger, yaw=0, duty_cycle=DT):
+    if vehicle is None: 
+        return
+
+    previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
+    vehicle.parameters["WP_YAW_BEHAVIOR"] = 2
+    time.sleep(1)
+
+    vx = math.cos(yaw)
+    vy = math.sin(yaw)
+    
+    while abs(vehicle.attitude.yaw - yaw) > 2: 
+        send_velocity(vehicle, logger, vx, vy, 0)
+        time.sleep(duty_cycle / 1000)
+    
+    vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
+    time.sleep(1)
+
+def calculate_velocity(xnorm, ynorm, max_speed, flip):
+    x_error = float(xnorm) - 0.5  # Positive when target is LEFT
+    y_error = 0.5 - float(ynorm)    # Positive when target is ABOVE
+    
+    vy = GAIN * y_error  # LEFT/RIGHT
+    vx = GAIN * x_error  # UP/DOWN
+
+    vx = -vx if flip else vx
+    vy = -vy if flip else vy
+
+    vx = max(min(max_speed, vx), -max_speed)
+    vy = max(min(max_speed, vy), -max_speed)
+
+    return vx, vy
+
+def receive_coordinates(sock: socket.socket, label_filter):
+    try:
+        print("\n>>> SENDING TO UNITY: detect")
+        sock.sendall(b"detect\n")  # Add newline
+        
+        # Set timeout for receiving
+        sock.settimeout(3.0)
+        
+        print(">>> Waiting for response from Unity...")
+        
+        # Try to receive data
+        data_buffer = b""
+        try:
+            while True:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                data_buffer += chunk
+                print(f">>> Received chunk: {chunk}")
+        except socket.timeout:
+            print(">>> Timeout while receiving from Unity")
+        
+        print(f">>> TOTAL DATA RECEIVED: {len(data_buffer)} bytes")
+        
+        if not data_buffer:
+            print(">>> UNITY SENT NOTHING!")
+            return None, None
+        
+        # Decode the data
+        decoded = data_buffer.decode('utf-8', errors='ignore').strip()
+        print(f">>> DECODED DATA: '{decoded}'")
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(decoded)
+            print(f">>> PARSED JSON: {data}")
+            
+            if "x" not in data or "y" not in data:
+                print(">>> JSON missing x or y keys")
+                return None, None
+            
+            if not label_filter(data):
+                print(">>> Label filter rejected", data)
+                return None, None
+            
+            # Check if values are null or None
+            if data["x"] is None or data["y"] is None:
+                print(f">>> Null coordinates: x={data['x']}, y={data['y']}")
+                return None, None
+            
+            # Convert to float
+            try:
+                x_val = float(data["x"])
+                y_val = float(data["y"])
+                print(f">>> RETURNING COORDINATES: ({x_val}, {y_val})")
+                return x_val, y_val
+            except (ValueError, TypeError) as e:
+                print(f">>> Error converting to float: {e}")
+                return None, None
+                
+        except json.JSONDecodeError as e:
+            print(f">>> Not valid JSON: {e}")
+            # Try to see if it's a simple string response
+            if "error" in decoded.lower() or "no detection" in decoded.lower():
+                print(f">>> Unity error message: {decoded}")
+            return None, None
+        
+    except Exception as e:
+        print(f">>> ERROR IN receive_coordinates: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
