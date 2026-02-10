@@ -267,3 +267,157 @@ def receive_coordinates(sock: socket.socket, label_filter):
         traceback.print_exc()
         return None, None
 
+def localize(
+        vehicle: Vehicle, 
+        sock: socket.socket, 
+        logger: logging.Logger, 
+        thresh=0.05, 
+        descent_speed=0.1,
+        lowered_alt=1,  
+        max_speed=0.2,
+        label_filter=lambda x: True,
+        duty_cycle=DT, 
+        camera_flip=False,
+        land=False, 
+        log_time_delay=1,
+        unity_drone_sock=None  # Add this parameter for Unity drone control
+    ): 
+
+    test_mode = vehicle is None
+    if test_mode:
+        logger.warning("Vehicle is None — running UNITY TEST MODE (WITH DRONE CONTROL).")
+        simulated_alt = 10.0  # Starting simulated altitude for test mode
+        
+        # Check if we have Unity drone socket
+        if unity_drone_sock is None:
+            logger.warning("No Unity drone socket provided - drone won't move in Unity!")
+        else:
+            logger.debug("Unity drone control socket available")
+
+    if not test_mode:
+        previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
+        vehicle.parameters["WP_YAW_BEHAVIOR"] = 0
+    else:
+        previous_wp_behaviour = None
+
+    vx, vy, vz = 0, 0, 0
+    height_status = "not_lowering"  
+    localize_status = "localizing"  
+    log_timer_start = time.time()
+    
+    # Initialize Kalman Filter
+    kf = KalmanFilter()  
+    centered_start_time = None
+    centered_duration = 0
+
+    logger.debug(f"Localizing with parameters: thresh={thresh}, pickup_alt={lowered_alt}")
+
+    def debug(string): 
+        nonlocal log_timer_start
+        log_timer_start = debug_with_delay(lambda: logger.debug(string), log_timer_start, log_time_delay)
+
+    def baro_control(): 
+        nonlocal vz, height_status, log_timer_start
+        if test_mode:
+            # Test mode handling - simulate altitude
+            nonlocal simulated_alt
+            if height_status == "lowering":
+                simulated_alt -= descent_speed * (duty_cycle / 1000)
+                if simulated_alt <= lowered_alt:
+                    height_status = "lowered"
+                    vz = 0
+                    simulated_alt = lowered_alt
+                    debug(f"TEST MODE: Lowered to {lowered_alt} meters")
+        else:
+            # Real drone handling
+            if height_status == "lowering" and vehicle.location.global_relative_frame.alt <= lowered_alt: 
+                height_status = "lowered"
+                vz = 0
+                debug(f"Lowered to {lowered_alt} meters")
+    
+    def land_control(): 
+        nonlocal vz, height_status
+        if not test_mode and height_status == "lowering" and get_landed_state(vehicle) == "on_ground": 
+            height_status = 'lowered'
+            debug(f"Landing complete")
+            cut_throttle(vehicle, logger, 0.1)
+
+    while True:
+        x_raw, y_raw = receive_coordinates(sock, label_filter)
+
+        if camera_flip and x_raw is not None:
+            x_raw = 1 - x_raw
+            y_raw = 1 - y_raw
+        
+        # APPLYING KF FILTER
+        x_smooth, y_smooth = kf.update(x_raw, y_raw)
+        
+        if x_smooth is not None and y_smooth is not None:
+            x_error = x_smooth - 0.5
+            y_error = 0.5 - y_smooth
+            
+            vx = GAIN * x_error
+            vy = GAIN * y_error
+            
+            # Apply flips
+            vx = -vx if FLIP_X else vx
+            vy = -vy if FLIP_Y else vy
+            
+            # Limit speed
+            vx = max(min(max_speed, vx), -max_speed)
+            vy = max(min(max_speed, vy), -max_speed)
+            
+            # Check if centered
+            centered = (abs(x_smooth - 0.5) < thresh and abs(y_smooth - 0.5) < thresh)
+            
+            if centered:
+                if centered_start_time is None:
+                    centered_start_time = time.time()
+                else:
+                    centered_duration = time.time() - centered_start_time
+                
+                if centered_duration >= CENTERED_DURATION:
+                    localize_status = "localized"
+                    vz = descent_speed
+                    debug(f"Centered for {centered_duration:.1f}s, starting descent")
+            else:
+                centered_start_time = None
+                centered_duration = 0
+                localize_status = "localizing"
+                
+            debug(
+                f"Position: Raw=({x_raw if x_raw is not None else 'None'},"
+                f"{y_raw if y_raw is not None else 'None'}), "
+                f"Smooth=({x_smooth:.3f},{y_smooth:.3f})"
+            )
+        else:
+            centered_start_time = None
+            centered_duration = 0
+            debug("No detection")
+            vx, vy = 0, 0  
+    
+        if localize_status == "localized":
+            height_status = "lowering"
+        
+        if land:
+            land_control()
+        else:
+            baro_control()
+            
+        if height_status == "lowered" and localize_status == "localized": 
+            debug("Localization and descent complete")
+            break
+    
+        if not test_mode:
+            send_velocity(vehicle, logger, vx, vy, vz)
+        else:
+            # Log what would happen in test mode
+            if vx != 0 or vy != 0 or vz != 0:
+                debug(f"TEST MODE: Would send velocity VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}")
+        
+        time.sleep(duty_cycle / 1000)
+
+    if not test_mode:
+        vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
+    logger.debug("Localization complete")
+
