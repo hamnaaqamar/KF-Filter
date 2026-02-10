@@ -421,3 +421,127 @@ def localize(
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
     logger.debug("Localization complete")
 
+def test_unity_connection():
+    """Simple test to check Unity connection"""
+    print("\n" + "="*60)
+    print("Testing Unity Connection...")
+    print("="*60)
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    
+    try:
+        print(f"Connecting to {MODEL_IP}:{MODEL_PORT}...")
+        sock.connect((MODEL_IP, MODEL_PORT))
+        print("✓ Connected to Unity")
+        
+        # Test different commands
+        test_commands = [
+            b"detect\n",
+            b"hello\n",
+            b"status\n",
+            b"ping\n"
+        ]
+        
+        for cmd in test_commands:
+            print(f"\nSending command: {cmd.decode().strip()}")
+            sock.sendall(cmd)
+            
+            try:
+                response = sock.recv(1024)
+                if response:
+                    print(f"Response: {response}")
+                    # Try to decode
+                    try:
+                        decoded = response.decode('utf-8')
+                        print(f"Decoded: {decoded}")
+                    except:
+                        print("Could not decode as UTF-8")
+                else:
+                    print("No response (empty)")
+                    
+            except socket.timeout:
+                print("Timeout - no response")
+            except Exception as e:
+                print(f"Error receiving: {e}")
+                
+            time.sleep(1)
+            
+    except ConnectionRefusedError:
+        print("✗ Connection refused. Is Unity running?")
+        print("Make sure:")
+        print("1. Unity is running the simulation")
+        print("2. The TCP server is listening on port 9000")
+        print("3. No firewall is blocking the connection")
+    except Exception as e:
+        print(f"✗ Connection error: {e}")
+    finally:
+        sock.close()
+        print("\n" + "="*60)
+        print("Test complete")
+        print("="*60)
+
+def main():
+    """Main function with better error handling"""
+    print("\nStarting Unity Localization Script...")
+    
+    # First test the connection
+    test_unity_connection()
+    
+    # Then try to run localization
+    choice = input("\nDo you want to continue with localization? (y/n): ")
+    if choice.lower() != 'y':
+        return
+    
+    # Connect to Unity
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((MODEL_IP, MODEL_PORT))
+        logger.debug("Connected to Unity Model.")
+        
+        # Try to connect to drone controller (port 9001)
+        drone_sock = None
+        try:
+            drone_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            drone_sock.connect((MODEL_IP, 9001))
+            logger.debug("Connected to Unity Drone Controller (port 9001)")
+            drone_sock.sendall(b"CONTROL\n")
+        except:
+            logger.warning("Could not connect to drone controller on port 9001")
+            drone_sock = None
+        
+        # Run localization
+        print("\nStarting localization loop...")
+        print("Press Ctrl+C to stop\n")
+        
+        # Run for a limited time or until success
+        localize(
+            None,  # No real vehicle
+            sock, 
+            logger, 
+            thresh=0.12,
+            unity_drone_sock=drone_sock,
+            log_time_delay=0.5  # More frequent logs
+        )
+        
+    except KeyboardInterrupt:
+        print("\n\nStopped by user")
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        if 'sock' in locals():
+            sock.close()
+        if 'drone_sock' in locals() and drone_sock:
+            try:
+                drone_sock.sendall(b"RELEASE\n")
+                drone_sock.close()
+            except:
+                pass
+        print("\nScript ended")
+
+if __name__ == "__main__":
+    main()
