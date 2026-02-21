@@ -252,11 +252,11 @@ def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
         logger: logging.Logger, 
-        thresh=0.05, 
-        descent_speed=0.1,
+        thresh=0.1,  # Increased threshold (10% from center is okay)
+        descent_speed=0.15,
         detection_alt=4.0,
         landing_alt=0.3,
-        max_speed=0.3,
+        max_speed=0.25,  # Reduced max speed
         label_filter=lambda x: True,
         duty_cycle=DT, 
         camera_flip=False,
@@ -276,25 +276,31 @@ def localize(
         previous_wp_behaviour = None
 
     vx, vy, vz = 0, 0, 0
-    flight_phase = "hover_detection"
+    flight_phase = "searching"  # Changed from "hover_detection"
     log_timer_start = time.time()
     
-    kf = KalmanFilter()  
+    kf = KalmanFilter(process_noise=0.05, measurement_noise=0.2)  # Increased noise tolerance
+    
+    # Centering variables
     centered_start_time = None
     centered_duration = 0
-    last_detection_time = time.time()
-    search_pattern_start = 0
-    search_direction = 1  # 1 for clockwise, -1 for counter-clockwise
     
-    # Search pattern parameters
-    search_radius = 0.2  # How far to move in search pattern
-    search_speed = 0.15   # Speed during search
-    search_phase = 0      # Current angle in search circle
+    # Detection tracking
+    last_detection_time = time.time()
+    detection_timeout = 5.0  # If no detection for 5 seconds, go to search mode
+    
+    # Search pattern variables
+    search_yaw = 0
+    search_step = 0
+    
+    # Store last known good position
+    last_good_x = 0.5
+    last_good_y = 0.5
 
     if not test_mode:
         current_alt = vehicle.location.global_relative_frame.alt
         logger.info(f"Current altitude: {current_alt:.2f}m")
-        logger.info(f"Will hover at {detection_alt}m for detection, then descend to land")
+        logger.info(f"Target detection altitude: {detection_alt}m")
     else:
         current_alt = 5.0
         simulated_alt = current_alt
@@ -317,62 +323,86 @@ def localize(
         
         current_time = time.time()
         
+        # Update Kalman filter (it handles None values internally)
+        x_smooth, y_smooth = kf.update(x_raw, y_raw)
+        
+        # Get current altitude
+        if not test_mode:
+            current_alt = vehicle.location.global_relative_frame.alt
+        
+        # ===== DETECTION HANDLING =====
         if x_raw is not None and y_raw is not None:
-            # Target detected!
+            # We have a detection!
             last_detection_time = current_time
-            search_pattern_start = 0  # Reset search pattern
+            last_good_x = x_smooth
+            last_good_y = y_smooth
             
-            logger.debug(f"Raw Unity coordinates: ({x_raw:.3f}, {y_raw:.3f})")
+            logger.debug(f"DETECTED: raw=({x_raw:.3f},{y_raw:.3f}) smoothed=({x_smooth:.3f},{y_smooth:.3f})")
             
-            if camera_flip:
-                x_raw = 1 - x_raw
-                y_raw = 1 - y_raw
-            
-            x_smooth, y_smooth = kf.update(x_raw, y_raw)
-            
-            # Calculate errors from center
-            x_error = x_smooth - 0.5
-            y_error = y_smooth - 0.5
-            
+            # In the detection handling section (around line where you calculate errors):
+
+            # Calculate errors from center (0.5, 0.5)
+            x_error = x_smooth - 0.5  # Positive = target is RIGHT of center
+            y_error = y_smooth - 0.5  # Positive = target is ABOVE center
+
             logger.debug(f"Errors: x_err={x_error:.3f}, y_err={y_error:.3f}")
+
+            # CORRECT MAPPING:
+            # Move in the direction that reduces the error
+            vx = GAIN * y_error   # Forward/back from vertical error
+            vy = GAIN * x_error   # Left/right from horizontal error
+
+            # Limit speed to prevent overshooting
+            vx = max(min(max_speed, vx), -max_speed)
+            vy = max(min(max_speed, vy), -max_speed)
+
+            logger.debug(f"Control: vx={vx:.3f}, vy={vy:.3f}")
+
+            # Determine if we're centered
+            centered = (abs(x_error) < thresh and abs(y_error) < thresh)
+                        
+            # PROPORTIONAL CONTROL - Simple and direct
+            # Map errors to velocities with gain
+            # IMPORTANT: We need to determine correct mapping
+            # Based on your earlier logs, when target is at (0.5, 0.5), drone is centered
             
-            # Calculate velocities based on errors
-            vx = GAIN * y_error  # Forward/backward from y_error
-            vy = GAIN * x_error  # Left/right from x_error
+            # Let's try this mapping:
+            # - When target is RIGHT of center (x_error > 0), drone should move RIGHT (positive vy)
+            # - When target is ABOVE center (y_error < 0), drone should move FORWARD (positive vx)
+            
+            vx = -GAIN * y_error  # Negative because y_error positive means target below
+            vy = GAIN * x_error    # Positive x_error means target right -> move right
             
             # Limit speed
             vx = max(min(max_speed, vx), -max_speed)
             vy = max(min(max_speed, vy), -max_speed)
             
-            logger.debug(f"Tracking velocities: vx={vx:.3f}, vy={vy:.3f}")
+            logger.debug(f"Control: vx={vx:.3f}, vy={vy:.3f}")
             
-            # Check if centered
-            centered = (abs(x_error) < thresh and abs(y_error) < thresh)
-            
-            if flight_phase == "hover_detection":
-                vz = 0
+            # State machine based on centering
+            if flight_phase == "searching":
+                # Found target while searching
+                flight_phase = "centering"
+                centered_start_time = None
+                logger.info("Target found - beginning centering")
                 
+            elif flight_phase == "centering":
                 if centered:
                     if centered_start_time is None:
                         centered_start_time = current_time
-                        logger.info("Target centered, starting centering timer")
+                        logger.info("Target centered - starting timer")
                     else:
                         centered_duration = current_time - centered_start_time
-                    
-                    if centered_duration >= CENTERED_DURATION:
-                        flight_phase = "centered"
-                        logger.info(f"Target centered for {centered_duration:.1f}s")
+                        if centered_duration >= CENTERED_DURATION:
+                            flight_phase = "descending"
+                            logger.info(f"Centered for {centered_duration:.1f}s - starting descent")
                 else:
                     centered_start_time = None
                     centered_duration = 0
                     
-            elif flight_phase == "centered":
-                logger.info("Starting descent to landing")
-                flight_phase = "descending"
-                centered_start_time = None
-                
             elif flight_phase == "descending":
-                if current_alt <= landing_alt + 0.1:
+                # Maintain center while descending
+                if current_alt <= landing_alt + 0.2:
                     flight_phase = "landed"
                     vz = 0
                     vx = 0
@@ -388,50 +418,60 @@ def localize(
                 break
                 
         else:
-            # No detection - enter search pattern
-            centered_start_time = None
-            centered_duration = 0
+            # NO DETECTION
+            logger.debug(f"No detection - last detection {current_time - last_detection_time:.1f}s ago")
             
-            time_since_detection = current_time - last_detection_time
+            # Check if we've lost the target for too long
+            if current_time - last_detection_time > detection_timeout:
+                if flight_phase != "searching":
+                    flight_phase = "searching"
+                    logger.info("Target lost - starting search pattern")
+                    search_yaw = 0
+                    search_step = 0
             
-            if time_since_detection < 2.0:
-                # Just lost target, hover in place briefly
-                vx, vy, vz = 0, 0, 0
-                debug(f"Target lost - hovering ({(2.0 - time_since_detection):.1f}s until search)")
-            else:
-                # Enter search pattern
-                if search_pattern_start == 0:
-                    search_pattern_start = current_time
-                    search_phase = 0
-                    logger.info("Starting search pattern - target lost")
+            # Set velocities based on phase
+            if flight_phase == "searching":
+                # Simple search pattern - slowly rotate and move in a grid
+                search_step += 1
                 
-                # Spiral search pattern
-                search_duration = current_time - search_pattern_start
-                
-                # Increase radius slowly over time
-                current_radius = min(search_radius, 0.05 + search_duration * 0.02)
-                
-                # Calculate search velocity (circle pattern)
-                search_phase += 0.05 * duty_cycle / 100  # Rotate slowly
-                vx = search_speed * math.cos(search_phase) * current_radius * 5
-                vy = search_speed * math.sin(search_phase) * current_radius * 5
+                if search_step < 50:
+                    # Move forward slowly
+                    vx = 0.1
+                    vy = 0
+                elif search_step < 100:
+                    # Move right
+                    vx = 0
+                    vy = 0.1
+                elif search_step < 150:
+                    # Move back
+                    vx = -0.1
+                    vy = 0
+                elif search_step < 200:
+                    # Move left
+                    vx = 0
+                    vy = -0.1
+                else:
+                    search_step = 0
+                    
                 vz = 0
+                debug(f"Searching: step={search_step}")
                 
-                debug(f"Searching: radius={current_radius:.2f}, phase={search_phase:.1f}")
+            elif flight_phase == "centering" or flight_phase == "descending":
+                # We lost the target while centering/descending - hover and wait
+                vx, vy, vz = 0, 0, 0
+                debug("Target lost - hovering and waiting")
+            else:
+                vx, vy, vz = 0, 0, 0
         
-        # Get current altitude
-        if not test_mode:
-            current_alt = vehicle.location.global_relative_frame.alt
+        # Safety check - if we're descending and very low, just land
+        if flight_phase == "descending" and current_alt <= 0.3:
+            logger.info("Very low altitude - switching to land")
+            flight_phase = "landed"
+            continue
         
         # Send velocity commands
         if not test_mode:
             send_velocity(vehicle, logger, vx, vy, vz)
-            
-            # Safety checks
-            if flight_phase == "descending" and current_alt <= 0.2:
-                logger.info("Very low altitude - forcing land")
-                vehicle.mode = VehicleMode("LAND")
-                break
         else:
             if flight_phase == "descending":
                 simulated_alt -= vz * (duty_cycle / 1000)
@@ -441,6 +481,13 @@ def localize(
             
             if unity_drone_sock is not None:
                 send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
+        
+        # Log current state
+        debug(
+            f"Phase: {flight_phase}, "
+            f"Alt: {current_alt:.2f}m, "
+            f"Vel: ({vx:.3f},{vy:.3f},{vz:.3f})"
+        )
         
         time.sleep(duty_cycle / 1000)
 
