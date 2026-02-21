@@ -18,7 +18,9 @@ DT = 100  # control loop period in ms
 # IMPORTANT:
 # These were present in your original script but not actually used.
 # If the drone moves opposite to what you expect on any axis, toggle these.
-FLIP_X = True
+# Based on latest logs, X correction was inverted (target x drifted to edge
+# while commanding correction). Keep this False for current setup.
+FLIP_X = False
 FLIP_Y = True
 
 CENTERED_DURATION = 4.0
@@ -317,6 +319,11 @@ def localize(
     kp_x = 0.5
     kp_y = 0.5
     dead_zone = 0.05
+    # Use stricter centering before initiating descent.
+    descent_entry_thresh = max(0.05, min(thresh, 0.08))
+    # During descent, pause/abort descent if target drifts too far.
+    descent_track_thresh = max(descent_entry_thresh + 0.04, 0.12)
+    descent_abort_thresh = max(descent_entry_thresh + 0.16, 0.22)
 
     if not test_mode:
         current_alt = vehicle.location.global_relative_frame.alt
@@ -374,6 +381,7 @@ def localize(
                 log.debug("DEAD ZONE")
 
             centered = abs(x_error) < thresh and abs(y_error) < thresh
+            ready_to_descend = abs(x_error) < descent_entry_thresh and abs(y_error) < descent_entry_thresh
             log.debug(
                 "DETECT raw=(%.3f,%.3f) err_raw=(%.3f,%.3f) err_ctrl=(%.3f,%.3f) vel=(%.3f,%.3f)",
                 x_smooth,
@@ -393,7 +401,7 @@ def localize(
                     log.info("TARGET FOUND")
 
             elif flight_phase == "centering":
-                if centered:
+                if ready_to_descend:
                     if centered_start_time is None:
                         centered_start_time = now
                         log.info("CENTERED - timer started")
@@ -409,7 +417,28 @@ def localize(
                     vx, vy, vz = 0.0, 0.0, 0.0
                     log.info("LANDED")
                 else:
-                    vz = abs(descent_speed)
+                    abs_x = abs(x_error)
+                    abs_y = abs(y_error)
+                    if abs_x > descent_abort_thresh or abs_y > descent_abort_thresh:
+                        # Target drifted too far while descending. Recenter first.
+                        flight_phase = "centering"
+                        centered_start_time = None
+                        vz = 0.0
+                        log.warning(
+                            "DESCENT ABORTED: large offset (|ex|=%.3f, |ey|=%.3f). Re-centering.",
+                            abs_x,
+                            abs_y,
+                        )
+                    elif abs_x > descent_track_thresh or abs_y > descent_track_thresh:
+                        # Keep correcting laterally but pause vertical descent.
+                        vz = 0.0
+                        log.debug(
+                            "DESCENT PAUSED: offset too large for safe descend (|ex|=%.3f, |ey|=%.3f).",
+                            abs_x,
+                            abs_y,
+                        )
+                    else:
+                        vz = abs(descent_speed)
 
             elif flight_phase == "landed":
                 if not test_mode:
@@ -433,7 +462,10 @@ def localize(
                     max_speed=max_speed,
                 )
                 if flight_phase == "descending":
-                    vz = abs(descent_speed)
+                    if abs(x_error) <= descent_track_thresh and abs(y_error) <= descent_track_thresh:
+                        vz = abs(descent_speed)
+                    else:
+                        vz = 0.0
                 log.debug(
                     "PREDICT track err_ctrl=(%.3f,%.3f) vel=(%.3f,%.3f)",
                     x_error,
@@ -442,6 +474,12 @@ def localize(
                     vy,
                 )
             else:
+                if flight_phase == "descending":
+                    # Do not keep descending blind. Return to centering immediately.
+                    flight_phase = "centering"
+                    centered_start_time = None
+                    log.warning("Detection missing during descent. Pausing descent and re-centering.")
+
                 if time_since_detection > detection_timeout and flight_phase != "searching":
                     flight_phase = "searching"
                     log.info("TARGET LOST")
