@@ -252,11 +252,11 @@ def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
         logger: logging.Logger, 
-        thresh=0.1,  # 10% from center is acceptable
-        descent_speed=0.1,  # Slower descent
+        thresh=0.08,  # 8% from center is acceptable
+        descent_speed=0.1,
         detection_alt=4.0,
         landing_alt=0.3,
-        max_speed=0.12,  # Much slower max speed (was 0.15)
+        max_speed=0.15,
         label_filter=lambda x: True,
         duty_cycle=DT, 
         camera_flip=False,
@@ -290,17 +290,17 @@ def localize(
     last_detection_time = time.time()
     detection_timeout = 3.0
     consecutive_detections = 0
-    min_detections_for_centering = 2  # Need 2 detections to trust centering
+    min_detections_for_centering = 2
     
     # Store last known good position
     last_good_x = 0.5
     last_good_y = 0.5
 
-    # Simple P controller (no PID to keep it simple)
-    Kp = 0.3  # Proportional gain (reduced from 0.8)
+    # Simple proportional control - DIRECT toward target
+    Kp = 0.4  # Gain
     
     # Dead zone - stop moving when very close
-    dead_zone = 0.05  # 5% dead zone
+    dead_zone = 0.05
 
     # Get current altitude
     if not test_mode:
@@ -353,40 +353,41 @@ def localize(
             
             logger.debug(f"ERRORS: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # SIMPLE CONTROL - just proportional
-            # Move in the direction that reduces the error
+            # SIMPLE DIRECT CONTROL - Move directly toward the target
+            # If target is RIGHT (x_error > 0), move RIGHT (positive vy)
+            # If target is LEFT (x_error < 0), move LEFT (negative vy)
+            # If target is ABOVE (y_error > 0), move FORWARD (positive vx)
+            # If target is BELOW (y_error < 0), move BACKWARD (negative vx)
             
-            # Check if we're in dead zone (very close to center)
+            # Check if we're in dead zone
             if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
-                # In dead zone - stop moving
                 vx = 0
                 vy = 0
                 logger.debug("DEAD ZONE: stopped")
             else:
-                # Simple P controller
-                vx = Kp * y_error   # Forward/back from vertical error
-                vy = Kp * x_error   # Left/right from horizontal error
+                # DIRECT control - move in the direction of the error
+                vx = Kp * y_error   # Forward/back based on vertical error
+                vy = Kp * x_error   # Left/right based on horizontal error
                 
                 # Limit speed
                 vx = max(min(max_speed, vx), -max_speed)
                 vy = max(min(max_speed, vy), -max_speed)
                 
-                logger.debug(f"VEL: vx={vx:.3f}, vy={vy:.3f}")
+                logger.debug(f"DIRECT VEL: vx={vx:.3f}, vy={vy:.3f}")
             
-            # Determine if we're centered (using threshold, not dead zone)
+            # Determine if we're centered
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
             
             # STATE MACHINE
             if flight_phase == "searching":
-                # Found target while searching
                 if consecutive_detections >= min_detections_for_centering:
                     flight_phase = "centering"
                     centered_start_time = None
-                    logger.info(f"TARGET FOUND - beginning centering (after {consecutive_detections} detections)")
-                vz = 0  # Hold altitude
+                    logger.info(f"TARGET FOUND - beginning centering")
+                vz = 0
                 
             elif flight_phase == "centering":
-                vz = 0  # Hold altitude while centering
+                vz = 0
                 
                 if centered:
                     if centered_start_time is None:
@@ -402,7 +403,6 @@ def localize(
                     centered_duration = 0
                     
             elif flight_phase == "descending":
-                # Maintain center while descending
                 if current_alt <= landing_alt + 0.2:
                     flight_phase = "landed"
                     vz = 0
@@ -425,53 +425,38 @@ def localize(
             
             logger.debug(f"NO DETECT: {time_since_detection:.1f}s since last detection")
             
-            # Check if we've lost the target for too long
-            if time_since_detection > detection_timeout:
-                if flight_phase != "searching":
-                    flight_phase = "searching"
-                    logger.info("TARGET LOST - starting search pattern")
+            if time_since_detection > detection_timeout and flight_phase != "searching":
+                flight_phase = "searching"
+                logger.info("TARGET LOST - starting search pattern")
             
-            # Set velocities based on phase
             if flight_phase == "searching":
                 # Simple back-and-forth search pattern
-                # Move in a small square pattern to find the target
                 search_step = int(current_time * 2) % 4
                 
                 if search_step == 0:
-                    vx = 0.08  # Move forward
+                    vx = 0.08
                     vy = 0
                 elif search_step == 1:
                     vx = 0
-                    vy = 0.08  # Move right
+                    vy = 0.08
                 elif search_step == 2:
-                    vx = -0.08  # Move back
+                    vx = -0.08
+                    vy = 0
                 else:
                     vx = 0
-                    vy = -0.08  # Move left
+                    vy = -0.08
                 
                 vz = 0
                 logger.debug(f"SEARCH: step={search_step}")
                 
-            elif flight_phase == "centering":
-                # Lost target during centering - stop and wait briefly
-                if time_since_detection < 2.0:
-                    vx, vy, vz = 0, 0, 0
-                    logger.debug(f"Lost target during centering - waiting")
-                else:
-                    # After waiting, go back to search
-                    flight_phase = "searching"
-                    logger.info("Target lost during centering - switching to search")
-                    vx, vy, vz = 0, 0, 0
-                    
-            elif flight_phase == "descending":
-                # Lost target during descent - stop descending and hover
+            elif flight_phase == "centering" or flight_phase == "descending":
                 vx, vy, vz = 0, 0, 0
                 if time_since_detection > 1.0:
-                    logger.warning(f"Lost target during descent - hovering")
+                    logger.warning(f"Lost target during {flight_phase} - hovering")
             else:
                 vx, vy, vz = 0, 0, 0
         
-        # Safety check - if we're descending and very low, just land
+        # Safety check
         if flight_phase == "descending" and current_alt <= 0.3:
             logger.info("VERY LOW ALTITUDE - forcing land")
             flight_phase = "landed"
@@ -490,26 +475,19 @@ def localize(
             if unity_drone_sock is not None:
                 send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
         
-        # Log current state periodically
-        if int(current_time * 2) % 10 == 0:  # Log every ~5 seconds
-            logger.info(
-                f"PHASE: {flight_phase}, "
-                f"ALT: {current_alt:.2f}m, "
-                f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
-            )
-        else:
-            debug(
-                f"PHASE: {flight_phase}, "
-                f"ALT: {current_alt:.2f}m, "
-                f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
-            )
+        # Log current state
+        debug(
+            f"PHASE: {flight_phase}, "
+            f"ALT: {current_alt:.2f}m, "
+            f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
+        )
         
         time.sleep(duty_cycle / 1000)
 
     if not test_mode:
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
     logger.info("Localization complete")
-    
+
 def test_unity_connection():
     """Test Unity connection and return a new socket"""
     print("\n" + "="*60)
