@@ -106,11 +106,21 @@ def debug_with_delay(to_print: Callable[[], None], timer_start, delay):
     return timer_start
 
 def get_landed_state(vehicle) -> Literal["undefined", "on_ground", "in_air", "takeoff", "landing"]:
-    states = ["undefined", "on_ground", "in_air", "takeoff", "landing"]
-    msg = vehicle.recv_match(type='EXTENDED_SYS_STATE', blocking=False)
-    if msg:
-        return states[msg.landed_state]
-    return states[0] 
+    """Get landed state using DroneKit attributes instead of pymavlink"""
+    if vehicle.system_status == 'STANDBY':
+        return "on_ground"
+    elif vehicle.system_status == 'ACTIVE':
+        if vehicle.armed:
+            if vehicle.location.global_relative_frame.alt < 0.5:
+                return "takeoff"
+            else:
+                return "in_air"
+        else:
+            return "on_ground"
+    elif vehicle.system_status == 'LANDING':
+        return "landing"
+    else:
+        return "undefined"
 
 def cut_throttle(vehicle: Vehicle, logger: logging.Logger, throttle=0.1): 
     if vehicle.location.global_relative_frame.alt > 2: 
@@ -489,7 +499,7 @@ def main():
         return
     
     # Connect to the Vehicle (SITL)
-    connection_string = '127.0.0.1:14550'  # Adjust this to match your mavproxy out port
+    connection_string = '192.168.56.1:14552'  # Adjust this to match your mavproxy out port
     logger.info(f"Connecting to vehicle on {connection_string}")
     
     try:
