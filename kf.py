@@ -3,6 +3,7 @@ import socket
 import time
 import json
 import logging
+import random
 from datetime import datetime
 from typing import Callable, Optional, Tuple
 
@@ -15,17 +16,24 @@ MODEL_PORT = 9000
 
 DT = 100  # control loop period in ms
 
-# IMPORTANT:
-# These were present in your original script but not actually used.
-# If the drone moves opposite to what you expect on any axis, toggle these.
-# Based on latest logs, X correction was inverted (target x drifted to edge
-# while commanding correction). Keep this False for current setup.
+# If the drone moves opposite to what you expect on any axis, toggle these. (ONLY THEN)
+# Keep this False for current setup.
 FLIP_X = False
 FLIP_Y = True
 
 CENTERED_DURATION = 4.0
 DROPOUT_PREDICT_SEC = 0.7
 MIN_COMMAND_SPEED = 0.01
+
+# Detection-loss simulation for Kalman prediction testing.
+# Keep disabled for real missions.
+SIMULATE_DETECTION_LOSS = True
+SIM_LOSS_MODE = "periodic"  # "periodic" or "random"
+SIM_LOSS_START_AFTER_SEC = 8.0
+SIM_LOSS_VISIBLE_SEC = 2.0
+SIM_LOSS_DURATION_SEC = 0.5
+SIM_LOSS_RANDOM_PROB = 0.2
+SIM_LOSS_RANDOM_SEED = 42
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -99,7 +107,6 @@ class KalmanFilter:
 
 
 def debug_with_delay(to_print: Callable[[], None], timer_start: float, delay: float) -> float:
-    # Log only when delay interval has elapsed (fixed from original).
     if time.time() - timer_start >= delay:
         to_print()
         return time.time()
@@ -227,6 +234,73 @@ def receive_coordinates(sock: socket.socket, label_filter: Callable[[dict], bool
         return None, None
 
 
+class DetectionLossSimulator:
+    """
+    Inject synthetic detection dropouts so Kalman prediction behavior can be tested.
+    """
+
+    def __init__(
+        self,
+        enabled: bool,
+        mode: str,
+        start_after_sec: float,
+        visible_sec: float,
+        loss_sec: float,
+        random_drop_prob: float,
+        random_seed: int,
+        log: logging.Logger,
+    ) -> None:
+        self.enabled = enabled
+        self.mode = mode.lower().strip()
+        self.start_after_sec = max(0.0, start_after_sec)
+        self.visible_sec = max(0.01, visible_sec)
+        self.loss_sec = max(0.01, loss_sec)
+        self.random_drop_prob = float(np.clip(random_drop_prob, 0.0, 1.0))
+        self._rng = random.Random(random_seed)
+        self._mission_start_time: Optional[float] = None
+        self._periodic_loss_active = False
+        self.log = log
+
+        self.forced_drop_frames = 0
+        self.loss_windows = 0
+
+        if self.mode not in ("periodic", "random"):
+            raise ValueError(f"Unsupported loss simulation mode: {self.mode}")
+
+    def should_drop(self, now: float, detection_available: bool) -> bool:
+        if not self.enabled:
+            return False
+
+        if self._mission_start_time is None:
+            self._mission_start_time = now
+        elapsed = now - self._mission_start_time
+        if elapsed < self.start_after_sec:
+            return False
+
+        if self.mode == "random":
+            drop = detection_available and (self._rng.random() < self.random_drop_prob)
+            if drop:
+                self.forced_drop_frames += 1
+            return drop
+
+        # Periodic mode.
+        cycle = self.visible_sec + self.loss_sec
+        phase = (elapsed - self.start_after_sec) % cycle
+        drop = phase >= self.visible_sec
+
+        if drop and not self._periodic_loss_active:
+            self._periodic_loss_active = True
+            self.loss_windows += 1
+            self.log.warning("SIM-LOSS periodic window ON")
+        elif not drop and self._periodic_loss_active:
+            self._periodic_loss_active = False
+            self.log.warning("SIM-LOSS periodic window OFF")
+
+        if drop and detection_available:
+            self.forced_drop_frames += 1
+        return drop and detection_available
+
+
 def arm_and_takeoff(vehicle: Vehicle, target_altitude: float) -> None:
     logger.info("Basic pre-arm checks")
     while not vehicle.is_armable:
@@ -293,6 +367,13 @@ def localize(
     duty_cycle: int = DT,
     log_time_delay: float = 1.0,
     unity_drone_sock: Optional[socket.socket] = None,
+    simulate_detection_loss: bool = SIMULATE_DETECTION_LOSS,
+    loss_mode: str = SIM_LOSS_MODE,
+    loss_start_after_sec: float = SIM_LOSS_START_AFTER_SEC,
+    loss_visible_sec: float = SIM_LOSS_VISIBLE_SEC,
+    loss_duration_sec: float = SIM_LOSS_DURATION_SEC,
+    loss_random_prob: float = SIM_LOSS_RANDOM_PROB,
+    loss_random_seed: int = SIM_LOSS_RANDOM_SEED,
 ) -> None:
     test_mode = vehicle is None
     if test_mode:
@@ -319,11 +400,34 @@ def localize(
     kp_x = 0.5
     kp_y = 0.5
     dead_zone = 0.05
-    # Use stricter centering before initiating descent.
+    #stricter centering before initiating descent.
     descent_entry_thresh = max(0.05, min(thresh, 0.08))
     # During descent, pause/abort descent if target drifts too far.
     descent_track_thresh = max(descent_entry_thresh + 0.04, 0.12)
     descent_abort_thresh = max(descent_entry_thresh + 0.16, 0.22)
+    prediction_control_frames = 0
+
+    loss_simulator = DetectionLossSimulator(
+        enabled=simulate_detection_loss,
+        mode=loss_mode,
+        start_after_sec=loss_start_after_sec,
+        visible_sec=loss_visible_sec,
+        loss_sec=loss_duration_sec,
+        random_drop_prob=loss_random_prob,
+        random_seed=loss_random_seed,
+        log=log,
+    )
+    sim_loss_log_timer = time.time()
+    if simulate_detection_loss:
+        log.warning(
+            "SIM-LOSS ENABLED mode=%s start=%.1fs visible=%.1fs loss=%.1fs random_prob=%.2f seed=%d",
+            loss_mode,
+            loss_start_after_sec,
+            loss_visible_sec,
+            loss_duration_sec,
+            loss_random_prob,
+            loss_random_seed,
+        )
 
     if not test_mode:
         current_alt = vehicle.location.global_relative_frame.alt
@@ -351,6 +455,14 @@ def localize(
 
         x_raw, y_raw = receive_coordinates(sock, label_filter)
         now = time.time()
+        raw_detection_valid = x_raw is not None and y_raw is not None
+        if loss_simulator.should_drop(now, raw_detection_valid):
+            x_raw, y_raw = None, None
+            sim_loss_log_timer = debug_with_delay(
+                lambda: log.debug("SIM-LOSS: forced detection drop (testing Kalman prediction path)"),
+                sim_loss_log_timer,
+                0.5,
+            )
 
         if not test_mode:
             current_alt = vehicle.location.global_relative_frame.alt
@@ -466,6 +578,7 @@ def localize(
                         vz = abs(descent_speed)
                     else:
                         vz = 0.0
+                prediction_control_frames += 1
                 log.debug(
                     "PREDICT track err_ctrl=(%.3f,%.3f) vel=(%.3f,%.3f)",
                     x_error,
@@ -520,6 +633,13 @@ def localize(
 
     if not test_mode and previous_wp_behaviour is not None:
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
+    if simulate_detection_loss:
+        log.info(
+            "SIM-LOSS summary: forced_drop_frames=%d loss_windows=%d prediction_control_frames=%d",
+            loss_simulator.forced_drop_frames,
+            loss_simulator.loss_windows,
+            prediction_control_frames,
+        )
     log.info("Done")
 
 
@@ -603,6 +723,13 @@ def main() -> None:
             landing_alt=0.3,
             max_speed=0.3,
             log_time_delay=0.5,
+            simulate_detection_loss=SIMULATE_DETECTION_LOSS,
+            loss_mode=SIM_LOSS_MODE,
+            loss_start_after_sec=SIM_LOSS_START_AFTER_SEC,
+            loss_visible_sec=SIM_LOSS_VISIBLE_SEC,
+            loss_duration_sec=SIM_LOSS_DURATION_SEC,
+            loss_random_prob=SIM_LOSS_RANDOM_PROB,
+            loss_random_seed=SIM_LOSS_RANDOM_SEED,
         )
 
         if vehicle.armed:
