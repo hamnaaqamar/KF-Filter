@@ -175,21 +175,26 @@ def receive_coordinates(sock: socket.socket, label_filter):
         sock.sendall(b"detect\n")
         
         # Set timeout for receiving
-        sock.settimeout(3.0)
+        sock.settimeout(1.0)  # Reduced timeout
         
         print(">>> Waiting for response from Unity...")
         
         # Try to receive data
         data_buffer = b""
         try:
+            # Read until newline or timeout
             while True:
                 chunk = sock.recv(256)
                 if not chunk:
                     break
                 data_buffer += chunk
+                if b'\n' in chunk:  # Stop at newline
+                    break
                 print(f">>> Received chunk: {chunk}")
         except socket.timeout:
             print(">>> Timeout while receiving from Unity")
+            # Don't close socket on timeout, just return None
+            return None, None
         
         print(f">>> TOTAL DATA RECEIVED: {len(data_buffer)} bytes")
         
@@ -197,49 +202,36 @@ def receive_coordinates(sock: socket.socket, label_filter):
             print(">>> UNITY SENT NOTHING!")
             return None, None
         
-        # Decode the data
+        # Decode and parse
         decoded = data_buffer.decode('utf-8', errors='ignore').strip()
         print(f">>> DECODED DATA: '{decoded}'")
         
-        # Try to parse as JSON
+        # Parse JSON (handle multiple JSON objects)
         try:
-            data = json.loads(decoded)
-            print(f">>> PARSED JSON: {data}")
+            # Split by newlines and take the first valid JSON
+            lines = decoded.split('\n')
+            for line in lines:
+                if line.strip():
+                    data = json.loads(line)
+                    print(f">>> PARSED JSON: {data}")
+                    
+                    if "x" in data and "y" in data and data["x"] is not None and data["y"] is not None:
+                        if label_filter(data):
+                            x_val = float(data["x"])
+                            y_val = float(data["y"])
+                            print(f">>> RETURNING COORDINATES: ({x_val}, {y_val})")
+                            return x_val, y_val
+                    else:
+                        print(f">>> Invalid or null coordinates: {data}")
             
-            if "x" not in data or "y" not in data:
-                print(">>> JSON missing x or y keys")
-                return None, None
-            
-            if not label_filter(data):
-                print(">>> Label filter rejected", data)
-                return None, None
-            
-            # Check if values are null or None
-            if data["x"] is None or data["y"] is None:
-                print(f">>> Null coordinates: x={data['x']}, y={data['y']}")
-                return None, None
-            
-            # Convert to float
-            try:
-                x_val = float(data["x"])
-                y_val = float(data["y"])
-                print(f">>> RETURNING COORDINATES: ({x_val}, {y_val})")
-                return x_val, y_val
-            except (ValueError, TypeError) as e:
-                print(f">>> Error converting to float: {e}")
-                return None, None
+            return None, None
                 
         except json.JSONDecodeError as e:
             print(f">>> Not valid JSON: {e}")
-            # Try to see if it's a simple string response
-            if "error" in decoded.lower() or "no detection" in decoded.lower():
-                print(f">>> Unity error message: {decoded}")
             return None, None
         
-    except Exception as e:
-        print(f">>> ERROR IN receive_coordinates: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    except (socket.error, ConnectionError) as e:
+        print(f">>> Socket error: {e}")
         return None, None
 
 def arm_and_takeoff(vehicle, target_altitude):
