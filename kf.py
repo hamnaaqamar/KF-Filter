@@ -270,7 +270,7 @@ def localize(
         logger: logging.Logger, 
         thresh=0.05, 
         descent_speed=0.1,
-        lowered_alt=1,  
+        lowered_alt=2,  # Changed to 2 meters (was 1)
         max_speed=0.2,
         label_filter=lambda x: True,
         duty_cycle=DT, 
@@ -283,13 +283,7 @@ def localize(
     test_mode = vehicle is None
     if test_mode:
         logger.warning("Vehicle is None — running UNITY TEST MODE (WITH DRONE CONTROL).")
-        simulated_alt = 10.0  # Starting simulated altitude for test mode
-        
-        # Check if we have Unity drone socket
-        if unity_drone_sock is None:
-            logger.warning("No Unity drone socket provided - drone won't move in Unity!")
-        else:
-            logger.debug("Unity drone control socket available")
+        simulated_alt = 10.0
 
     if not test_mode:
         previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
@@ -298,7 +292,8 @@ def localize(
         previous_wp_behaviour = None
 
     vx, vy, vz = 0, 0, 0
-    height_status = "not_lowering"  
+    # States: "searching" -> "centered" -> "lowering" -> "lowered"
+    flight_phase = "searching"  # New state variable
     localize_status = "localizing"  
     log_timer_start = time.time()
     
@@ -307,37 +302,18 @@ def localize(
     centered_start_time = None
     centered_duration = 0
 
+    # Store takeoff altitude
+    if not test_mode:
+        takeoff_alt = vehicle.location.global_relative_frame.alt
+        logger.info(f"Takeoff altitude: {takeoff_alt:.2f}m, Will descend to: {lowered_alt}m")
+    else:
+        takeoff_alt = 5.0
+
     logger.debug(f"Localizing with parameters: thresh={thresh}, pickup_alt={lowered_alt}")
 
     def debug(string): 
         nonlocal log_timer_start
         log_timer_start = debug_with_delay(lambda: logger.debug(string), log_timer_start, log_time_delay)
-
-    def baro_control(): 
-        nonlocal vz, height_status, log_timer_start
-        if test_mode:
-            # Test mode handling - simulate altitude
-            nonlocal simulated_alt
-            if height_status == "lowering":
-                simulated_alt -= descent_speed * (duty_cycle / 1000)
-                if simulated_alt <= lowered_alt:
-                    height_status = "lowered"
-                    vz = 0
-                    simulated_alt = lowered_alt
-                    debug(f"TEST MODE: Lowered to {lowered_alt} meters")
-        else:
-            # Real drone handling
-            if height_status == "lowering" and vehicle.location.global_relative_frame.alt <= lowered_alt: 
-                height_status = "lowered"
-                vz = 0
-                debug(f"Lowered to {lowered_alt} meters")
-    
-    def land_control(): 
-        nonlocal vz, height_status
-        if not test_mode and height_status == "lowering" and get_landed_state(vehicle) == "on_ground": 
-            height_status = 'lowered'
-            debug(f"Landing complete")
-            cut_throttle(vehicle, logger, 0.1)
 
     while True:
         x_raw, y_raw = receive_coordinates(sock, label_filter)
@@ -353,64 +329,117 @@ def localize(
             x_error = x_smooth - 0.5
             y_error = 0.5 - y_smooth
             
-            vx = GAIN * x_error
-            vy = GAIN * y_error
-            
-            # Apply flips
-            vx = -vx if FLIP_X else vx
-            vy = -vy if FLIP_Y else vy
-            
-            # Limit speed
-            vx = max(min(max_speed, vx), -max_speed)
-            vy = max(min(max_speed, vy), -max_speed)
+            # Calculate horizontal velocities based on flight phase
+            if flight_phase == "searching" or flight_phase == "centered":
+                # We're at takeoff altitude, trying to center
+                vx = GAIN * x_error
+                vy = GAIN * y_error
+                
+                # Apply flips
+                vx = -vx if FLIP_X else vx
+                vy = -vy if FLIP_Y else vy
+                
+                # Limit speed
+                vx = max(min(max_speed, vx), -max_speed)
+                vy = max(min(max_speed, vy), -max_speed)
+                
+                # No vertical movement while searching/centering
+                vz = 0
+            else:  # lowering phase
+                # Maintain position while descending
+                vx = GAIN * x_error
+                vy = GAIN * y_error
+                
+                vx = -vx if FLIP_X else vx
+                vy = -vy if FLIP_Y else vy
+                
+                vx = max(min(max_speed, vx), -max_speed)
+                vy = max(min(max_speed, vy), -max_speed)
+                
+                # Keep descending at constant speed
+                vz = descent_speed
             
             # Check if centered
             centered = (abs(x_smooth - 0.5) < thresh and abs(y_smooth - 0.5) < thresh)
             
-            if centered:
-                if centered_start_time is None:
-                    centered_start_time = time.time()
+            # State machine for flight phases
+            if flight_phase == "searching":
+                if centered:
+                    if centered_start_time is None:
+                        centered_start_time = time.time()
+                        debug("Target detected, starting centering timer")
+                    else:
+                        centered_duration = time.time() - centered_start_time
+                    
+                    if centered_duration >= CENTERED_DURATION:
+                        flight_phase = "centered"
+                        logger.info(f"Target centered for {centered_duration:.1f}s, ready to descend")
                 else:
-                    centered_duration = time.time() - centered_start_time
+                    centered_start_time = None
+                    centered_duration = 0
+                    
+            elif flight_phase == "centered":
+                # We're centered at takeoff altitude
+                logger.info("Starting descent to pickup altitude")
+                flight_phase = "lowering"
                 
-                if centered_duration >= CENTERED_DURATION:
-                    localize_status = "localized"
-                    vz = descent_speed
-                    debug(f"Centered for {centered_duration:.1f}s, starting descent")
-            else:
-                centered_start_time = None
-                centered_duration = 0
-                localize_status = "localizing"
+            elif flight_phase == "lowering":
+                # Check if we've reached the target altitude
+                if not test_mode:
+                    current_alt = vehicle.location.global_relative_frame.alt
+                    if current_alt <= lowered_alt:
+                        flight_phase = "lowered"
+                        vz = 0
+                        logger.info(f"Reached pickup altitude: {current_alt:.2f}m")
+                else:
+                    # Test mode
+                    if simulated_alt <= lowered_alt:
+                        flight_phase = "lowered"
+                        vz = 0
+                        simulated_alt = lowered_alt
+                        debug(f"TEST MODE: Lowered to {lowered_alt} meters")
                 
             debug(
-                f"Position: Raw=({x_raw if x_raw is not None else 'None'},"
-                f"{y_raw if y_raw is not None else 'None'}), "
-                f"Smooth=({x_smooth:.3f},{y_smooth:.3f})"
+                f"Phase: {flight_phase}, "
+                f"Position: ({x_smooth:.3f},{y_smooth:.3f}), "
+                f"Vel: ({vx:.3f},{vy:.3f},{vz:.3f})"
             )
         else:
+            # No detection
             centered_start_time = None
             centered_duration = 0
-            debug("No detection")
-            vx, vy = 0, 0  
-    
-        if localize_status == "localized":
-            height_status = "lowering"
-        
-        if land:
-            land_control()
-        else:
-            baro_control()
             
-        if height_status == "lowered" and localize_status == "localized": 
-            debug("Localization and descent complete")
-            break
+            if flight_phase == "searching":
+                # Hover in place while searching
+                vx, vy, vz = 0, 0, 0
+                debug("No detection - hovering at takeoff altitude")
+            elif flight_phase == "lowering":
+                # Continue descending slowly even without detection
+                vx, vy = 0, 0
+                vz = descent_speed * 0.5  # Descend slower when no detection
+                debug(f"No detection - descending slowly at {vz:.3f} m/s")
+        
+        # Break condition
+        if flight_phase == "lowered":
+            if land:
+                # If land flag is True, we'll land after reaching pickup altitude
+                logger.info("Starting landing sequence")
+                if not test_mode:
+                    vehicle.mode = VehicleMode("LAND")
+                break
+            else:
+                # Just hover at pickup altitude
+                logger.info("Reached pickup altitude, hovering")
+                break
     
+        # Send velocity commands
         if not test_mode:
             send_velocity(vehicle, logger, vx, vy, vz)
         else:
-            # Log what would happen in test mode
             if vx != 0 or vy != 0 or vz != 0:
                 debug(f"TEST MODE: Would send velocity VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}")
+            if unity_drone_sock is not None:
+                send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
         
         time.sleep(duty_cycle / 1000)
 
@@ -490,72 +519,79 @@ def main():
     if choice.lower() != 'y':
         return
     
-    # Connect to the Vehicle (SITL)
-    connection_string = '192.168.56.1:14552'  # Adjust this to match your mavproxy out port
+    # Connect to the Vehicle through MAVProxy
+    connection_string = '192.168.56.1:14552'
     logger.info(f"Connecting to vehicle on {connection_string}")
     
     try:
-        vehicle = connect(connection_string, wait_ready=True)
+        vehicle = connect(connection_string, wait_ready=True, timeout=30)
         logger.info("Vehicle connected")
         
-        # Arm and takeoff to 10 meters
-        target_altitude = 10  # Adjust as needed
-        arm_and_takeoff(vehicle, target_altitude)
+        # Check if vehicle is already flying
+        current_alt = vehicle.location.global_relative_frame.alt
+        logger.info(f"Current altitude: {current_alt:.2f}m")
         
-        # Give the drone a moment to stabilize at altitude
+        if current_alt < 1:  # If on ground or very low
+            target_altitude = 10
+            arm_and_takeoff(vehicle, target_altitude)
+        else:
+            logger.info("Vehicle already airborne, skipping takeoff")
+            if vehicle.mode != "GUIDED":
+                vehicle.mode = VehicleMode("GUIDED")
+        
+        # Give the drone a moment to stabilize
         logger.info("Stabilizing at altitude...")
-        time.sleep(2)
+        time.sleep(3)
         
-        # Connect to Unity
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect((MODEL_IP, MODEL_PORT))
-        logger.debug("Connected to Unity Model.")
-        
-        # Try to connect to drone controller (port 9001)
-        drone_sock = None
-        try:
-            drone_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            drone_sock.connect((MODEL_IP, 9001))
-            logger.debug("Connected to Unity Drone Controller (port 9001)")
-            drone_sock.sendall(b"CONTROL\n")
-        except:
-            logger.warning("Could not connect to drone controller on port 9001")
-            drone_sock = None
+        # Connect to Unity with retry logic
+        sock = None
+        for attempt in range(3):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect(('127.0.0.1', MODEL_PORT))
+                logger.debug(f"Connected to Unity Model on attempt {attempt+1}")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to connect to Unity (attempt {attempt+1}): {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(1)
         
         # Run localization
         print("\nStarting localization loop...")
         print("Press Ctrl+C to stop\n")
         
-        # Run localization with real vehicle
         localize(
-            vehicle,  # Using real vehicle
+            vehicle,
             sock, 
             logger, 
-            thresh=0.12,
-            lowered_alt=2,  # Descend to 2 meters when centered
-            descent_speed=0.2,
-            max_speed=0.3,
-            unity_drone_sock=drone_sock,
-            log_time_delay=0.5,  # More frequent logs
-            land=True  # Land when done
+            thresh=0.12,           # How close to center needs to be
+            lowered_alt=2,         # Descend to 2 meters (not ground)
+            descent_speed=0.2,     # Descend at 0.2 m/s
+            max_speed=0.3,         # Max horizontal speed
+            land=False,            # Set to False to just hover at pickup altitude
+            log_time_delay=0.5
         )
         
         # After localization completes, land if not already landed
         logger.info("Localization complete, landing...")
-        if vehicle.armed:
+        if vehicle.armed and vehicle.location.global_relative_frame.alt > 0.5:
             vehicle.mode = VehicleMode("LAND")
             
         # Wait for landing
-        while vehicle.armed:
+        timeout = time.time() + 30  # 30 second timeout
+        while vehicle.armed and time.time() < timeout:
             logger.info(f" Landing... Altitude: {vehicle.location.global_relative_frame.alt:.2f}")
             time.sleep(1)
             
-        logger.info("Landed successfully")
+        if not vehicle.armed:
+            logger.info("Landed successfully")
+        else:
+            logger.warning("Landing timeout - vehicle still armed")
         
     except KeyboardInterrupt:
         print("\n\nStopped by user")
-        # Attempt to land safely on interrupt
         if 'vehicle' in locals() and vehicle.armed:
             logger.info("Emergency landing...")
             vehicle.mode = VehicleMode("LAND")
@@ -568,11 +604,8 @@ def main():
         if 'vehicle' in locals():
             vehicle.close()
         if 'sock' in locals():
-            sock.close()
-        if 'drone_sock' in locals() and drone_sock:
             try:
-                drone_sock.sendall(b"RELEASE\n")
-                drone_sock.close()
+                sock.close()
             except:
                 pass
         print("\nScript ended")
