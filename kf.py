@@ -13,16 +13,12 @@ import numpy as np
 MODEL_IP = "127.0.0.1"
 MODEL_PORT = 9000
 
-GAIN = 2.0
+GAIN = 0.8
 DT = 100
 
 FLIP_X = True
-FLIP_Y = False
+FLIP_Y = True
 CENTERED_DURATION = 4
-
-#print("Connecting to vehicle on: tcp:127.0.0.1:5762")
-#vehicle = connect('tcp:127.0.0.1:5762', wait_ready=True)
-
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -33,17 +29,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-def connect_to_ardupilot():
-    """Connect to Ardupilot SITL"""
-    print("Connecting to Ardupilot on: tcp:127.0.0.1:14550")
-    try:
-        vehicle = connect('tcp:127.0.0.1:14550', wait_ready=True, timeout=60)
-        print(f"Connected to vehicle: {vehicle.version}")
-        return vehicle
-    except Exception as e:
-        print(f"Failed to connect to Ardupilot: {e}")
-        return None
 
 class KalmanFilter:
     
@@ -113,42 +98,7 @@ class KalmanFilter:
             print(f"Kalman filter update error: {e}")
         
         return float(self.state[0]), float(self.state[1])
-"""   
-class KalmanFilter:
-    
-    def __init__(self):
-        self.state = np.array([0.5, 0.5, 0.0, 0.0])  # x, y, vx, vy
-        self.last_time = time.time()
-        self.trust_camera = 0.8 
-        
-    def update(self, camera_x, camera_y):
-        current_time = time.time()
-        dt = current_time - self.last_time
-        self.last_time = current_time
-        
-        if camera_x is None: 
-            # Standard KF prediction when no camera data
-            self.state[0] += self.state[2] * dt  # x = x + vx*dt
-            self.state[1] += self.state[3] * dt  # y = y + vy*dt
-        else:  
-            # Update with camera measurement
-            predicted_x = self.state[0] + self.state[2] * dt
-            predicted_y = self.state[1] + self.state[3] * dt
-            
-            # Fusion of prediction and measurement
-            self.state[0] = predicted_x * (1 - self.trust_camera) + camera_x * self.trust_camera
-            self.state[1] = predicted_y * (1 - self.trust_camera) + camera_y * self.trust_camera
-            
-            # Update velocities based on position change
-            self.state[2] = (self.state[0] - predicted_x) / dt if dt > 0 else 0
-            self.state[3] = (self.state[1] - predicted_y) / dt if dt > 0 else 0
-        
-        # Clamp positions between 0 and 1
-        self.state[0] = max(0, min(1, self.state[0]))
-        self.state[1] = max(0, min(1, self.state[1]))
-        
-        return self.state[0], self.state[1]
-"""
+
 def debug_with_delay(to_print: Callable[[], None], timer_start, delay): 
     if time.time() - timer_start <= delay: 
         to_print()
@@ -204,91 +154,114 @@ def send_velocity(vehicle: Vehicle, logger: logging.Logger, vx, vy, vz):
 def send_velocity_to_unity(sock: socket.socket, vx: float, vy: float, vz: float):
     """Send velocity commands to Unity drone controller"""
     try:
-        # Note: Unity might use different coordinate system
-        # Adjust signs if needed based on your Unity setup
         command = f"VEL:{vx:.4f},{vy:.4f},{vz:.4f}\n"
         sock.sendall(command.encode())
     except Exception as e:
         print(f">>> ERROR sending velocity to Unity: {e}")
-        
-def yaw_to_angle(vehicle: Vehicle, logger: logging.Logger, yaw=0, duty_cycle=DT):
-    if vehicle is None: 
-        return
-
-    previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
-    vehicle.parameters["WP_YAW_BEHAVIOR"] = 2
-    time.sleep(1)
-
-    vx = math.cos(yaw)
-    vy = math.sin(yaw)
-    
-    while abs(vehicle.attitude.yaw - yaw) > 2: 
-        send_velocity(vehicle, logger, vx, vy, 0)
-        time.sleep(duty_cycle / 1000)
-    
-    vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
-    time.sleep(1)
-
-def calculate_velocity(xnorm, ynorm, max_speed, flip):
-    x_error = float(xnorm) - 0.5  # Positive when target is LEFT
-    y_error = 0.5 - float(ynorm)    # Positive when target is ABOVE
-    
-    vy = GAIN * y_error  # LEFT/RIGHT
-    vx = GAIN * x_error  # UP/DOWN
-
-    vx = -vx if flip else vx
-    vy = -vy if flip else vy
-
-    vx = max(min(max_speed, vx), -max_speed)
-    vy = max(min(max_speed, vy), -max_speed)
-
-    return vx, vy
-
-def is_valid_json(s: str) -> bool:
-    try:
-        json.loads(s)
-        return True
-    except json.JSONDecodeError:
-        return False
 
 def receive_coordinates(sock: socket.socket, label_filter):
     try:
-        sock.settimeout(0.5)
+        print("\n>>> SENDING TO UNITY: detect")
+        sock.sendall(b"detect\n")
         
+        # Set timeout for receiving
+        sock.settimeout(3.0)
+        
+        print(">>> Waiting for response from Unity...")
+        
+        # Try to receive data
+        data_buffer = b""
         try:
-            # Read until newline
-            data = b""
             while True:
-                chunk = sock.recv(1)
-                if not chunk or chunk == b'\n':
+                chunk = sock.recv(256)
+                if not chunk:
                     break
-                data += chunk
-            
-            if data:
-                decoded = data.decode('utf-8').strip()
-                print(f">>> RECEIVED: {decoded}")
-                
-                if decoded and is_valid_json(decoded):
-                    data_dict = json.loads(decoded)
-                    
-                    x_val = data_dict.get("x")
-                    y_val = data_dict.get("y")
-                    
-                    if x_val is None or y_val is None:
-                        return None, None
-                    
-                    try:
-                        return float(x_val), float(y_val)
-                    except:
-                        return None, None
-                    
+                data_buffer += chunk
+                print(f">>> Received chunk: {chunk}")
         except socket.timeout:
+            print(">>> Timeout while receiving from Unity")
+        
+        print(f">>> TOTAL DATA RECEIVED: {len(data_buffer)} bytes")
+        
+        if not data_buffer:
+            print(">>> UNITY SENT NOTHING!")
             return None, None
+        
+        # Decode the data
+        decoded = data_buffer.decode('utf-8', errors='ignore').strip()
+        print(f">>> DECODED DATA: '{decoded}'")
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(decoded)
+            print(f">>> PARSED JSON: {data}")
             
+            if "x" not in data or "y" not in data:
+                print(">>> JSON missing x or y keys")
+                return None, None
+            
+            if not label_filter(data):
+                print(">>> Label filter rejected", data)
+                return None, None
+            
+            # Check if values are null or None
+            if data["x"] is None or data["y"] is None:
+                print(f">>> Null coordinates: x={data['x']}, y={data['y']}")
+                return None, None
+            
+            # Convert to float
+            try:
+                x_val = float(data["x"])
+                y_val = float(data["y"])
+                print(f">>> RETURNING COORDINATES: ({x_val}, {y_val})")
+                return x_val, y_val
+            except (ValueError, TypeError) as e:
+                print(f">>> Error converting to float: {e}")
+                return None, None
+                
+        except json.JSONDecodeError as e:
+            print(f">>> Not valid JSON: {e}")
+            # Try to see if it's a simple string response
+            if "error" in decoded.lower() or "no detection" in decoded.lower():
+                print(f">>> Unity error message: {decoded}")
+            return None, None
+        
     except Exception as e:
-        print(f">>> ERROR: {e}")
+        print(f">>> ERROR IN receive_coordinates: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None, None
-"""       
+
+def arm_and_takeoff(vehicle, target_altitude):
+    """
+    Arms vehicle and fly to target_altitude.
+    """
+    logger.info("Basic pre-arm checks")
+    # Don't try to arm until autopilot is ready
+    while not vehicle.is_armable:
+        logger.info(" Waiting for vehicle to initialise...")
+        time.sleep(1)
+
+    logger.info("Arming motors")
+    vehicle.mode = VehicleMode("GUIDED")
+    vehicle.armed = True
+
+    while not vehicle.armed:
+        logger.info(" Waiting for arming...")
+        time.sleep(1)
+
+    logger.info("Taking off!")
+    vehicle.simple_takeoff(target_altitude)
+
+    # Wait until the vehicle reaches a safe height
+    while True:
+        logger.info(f" Altitude: {vehicle.location.global_relative_frame.alt:.2f}")
+        # Break and return from function just below target altitude
+        if vehicle.location.global_relative_frame.alt >= target_altitude * 0.95:
+            logger.info("Reached target altitude")
+            break
+        time.sleep(1)
+
 def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
@@ -302,7 +275,7 @@ def localize(
         camera_flip=False,
         land=False, 
         log_time_delay=1,
-        unity_drone_sock=None  # Add this parameter for Unity drone control
+        unity_drone_sock=None
     ): 
 
     test_mode = vehicle is None
@@ -364,43 +337,6 @@ def localize(
             debug(f"Landing complete")
             cut_throttle(vehicle, logger, 0.1)
 
-    # Add debug for centering
-    def check_centering(x_smooth, y_smooth):
-        nonlocal centered_start_time, centered_duration, localize_status
-        
-        # Handle None values - can't center without coordinates
-        if x_smooth is None or y_smooth is None:
-            if centered_start_time is not None:
-                debug(f"Lost centering after {time.time() - centered_start_time:.1f}s")
-            centered_start_time = None
-            centered_duration = 0
-            localize_status = "localizing"
-            return False
-        
-        x_error = abs(x_smooth - 0.5)
-        y_error = abs(y_smooth - 0.5)
-        centered = (x_error < thresh and y_error < thresh)
-        
-        if centered:
-            if centered_start_time is None:
-                centered_start_time = time.time()
-                debug(f"CENTERING STARTED: x_error={x_error:.3f}, y_error={y_error:.3f}")
-            else:
-                centered_duration = time.time() - centered_start_time
-                if centered_duration >= CENTERED_DURATION:
-                    localize_status = "localized"
-                    debug(f"CENTERED FOR {centered_duration:.1f}s - READY FOR DESCENT")
-                else:
-                    debug(f"Centering: {centered_duration:.1f}s (need {CENTERED_DURATION}s)")
-        else:
-            if centered_start_time is not None:
-                debug(f"Lost centering after {time.time() - centered_start_time:.1f}s")
-            centered_start_time = None
-            centered_duration = 0
-            localize_status = "localizing"
-        
-        return centered
-
     while True:
         x_raw, y_raw = receive_coordinates(sock, label_filter)
 
@@ -426,29 +362,34 @@ def localize(
             vx = max(min(max_speed, vx), -max_speed)
             vy = max(min(max_speed, vy), -max_speed)
             
-            # Check if centered with detailed logging
-            centered = check_centering(x_smooth, y_smooth)
+            # Check if centered
+            centered = (abs(x_smooth - 0.5) < thresh and abs(y_smooth - 0.5) < thresh)
             
-            if centered_duration >= CENTERED_DURATION:
-                vz = descent_speed
-                debug(f"Starting descent at {descent_speed} m/s")
-            
-            # FIXED: Safe formatting for raw values
-            raw_x_str = f"{x_raw:.3f}" if x_raw is not None else "None"
-            raw_y_str = f"{y_raw:.3f}" if y_raw is not None else "None"
-            
+            if centered:
+                if centered_start_time is None:
+                    centered_start_time = time.time()
+                else:
+                    centered_duration = time.time() - centered_start_time
+                
+                if centered_duration >= CENTERED_DURATION:
+                    localize_status = "localized"
+                    vz = descent_speed
+                    debug(f"Centered for {centered_duration:.1f}s, starting descent")
+            else:
+                centered_start_time = None
+                centered_duration = 0
+                localize_status = "localizing"
+                
             debug(
-                f"Position: Raw=({raw_x_str},{raw_y_str}), "
-                f"Smooth=({x_smooth:.3f},{y_smooth:.3f}), "
-                f"Error=({x_error:.3f},{y_error:.3f}), "
-                f"Velocity=({vx:.3f},{vy:.3f},{vz:.3f})"
+                f"Position: Raw=({x_raw if x_raw is not None else 'None'},"
+                f"{y_raw if y_raw is not None else 'None'}), "
+                f"Smooth=({x_smooth:.3f},{y_smooth:.3f})"
             )
         else:
             centered_start_time = None
             centered_duration = 0
-            localize_status = "localizing"
-            debug("No detection - maintaining last known position")
-            vx, vy = 0, 0  # Stop horizontal movement when no detection
+            debug("No detection")
+            vx, vy = 0, 0  
     
         if localize_status == "localized":
             height_status = "lowering"
@@ -465,17 +406,9 @@ def localize(
         if not test_mode:
             send_velocity(vehicle, logger, vx, vy, vz)
         else:
-            # Send velocity commands to Unity drone controller
-            if unity_drone_sock is not None:
-                try:
-                    send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
-                    debug(f"Sent to Unity: VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}, Alt={simulated_alt:.1f}m")
-                except Exception as e:
-                    debug(f"Failed to send to Unity: {e}")
-            else:
-                # Fallback to logging only
-                if vx != 0 or vy != 0 or vz != 0:
-                    debug(f"TEST MODE (No Unity): Would send VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}")
+            # Log what would happen in test mode
+            if vx != 0 or vy != 0 or vz != 0:
+                debug(f"TEST MODE: Would send velocity VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}")
         
         time.sleep(duty_cycle / 1000)
 
@@ -483,299 +416,164 @@ def localize(
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
     logger.debug("Localization complete")
 
+def test_unity_connection():
+    """Simple test to check Unity connection"""
+    print("\n" + "="*60)
+    print("Testing Unity Connection...")
+    print("="*60)
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    
+    try:
+        print(f"Connecting to {MODEL_IP}:{MODEL_PORT}...")
+        sock.connect((MODEL_IP, MODEL_PORT))
+        print("✓ Connected to Unity")
+        
+        # Test different commands
+        test_commands = [
+            b"detect\n",
+            b"hello\n",
+            b"status\n",
+            b"ping\n"
+        ]
+        
+        for cmd in test_commands:
+            print(f"\nSending command: {cmd.decode().strip()}")
+            sock.sendall(cmd)
+            
+            try:
+                response = sock.recv(1024)
+                if response:
+                    print(f"Response: {response}")
+                    # Try to decode
+                    try:
+                        decoded = response.decode('utf-8')
+                        print(f"Decoded: {decoded}")
+                    except:
+                        print("Could not decode as UTF-8")
+                else:
+                    print("No response (empty)")
+                    
+            except socket.timeout:
+                print("Timeout - no response")
+            except Exception as e:
+                print(f"Error receiving: {e}")
+                
+            time.sleep(1)
+            
+    except ConnectionRefusedError:
+        print("✗ Connection refused. Is Unity running?")
+        print("Make sure:")
+        print("1. Unity is running the simulation")
+        print("2. The TCP server is listening on port 9000")
+        print("3. No firewall is blocking the connection")
+    except Exception as e:
+        print(f"✗ Connection error: {e}")
+    finally:
+        sock.close()
+        print("\n" + "="*60)
+        print("Test complete")
+        print("="*60)
 
 def main():
-    # Connect to Unity camera for detection
-    camera_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    camera_sock.connect((MODEL_IP, MODEL_PORT))
-    logger.debug("Connected to Unity Camera.")
+    """Main function with better error handling"""
+    print("\nStarting Unity Localization Script...")
     
-    # Connect to Unity drone controller (port 9001)
-    drone_sock = None
+    # First test the connection
+    test_unity_connection()
+    
+    # Then try to run localization
+    choice = input("\nDo you want to continue with localization? (y/n): ")
+    if choice.lower() != 'y':
+        return
+    
+    # Connect to the Vehicle (SITL)
+    connection_string = '127.0.0.1:14550'  # Adjust this to match your mavproxy out port
+    logger.info(f"Connecting to vehicle on {connection_string}")
+    
     try:
-        drone_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        drone_sock.connect((MODEL_IP, 9001))  # Drone controller port
-        logger.debug("Connected to Unity Drone Controller.")
+        vehicle = connect(connection_string, wait_ready=True)
+        logger.info("Vehicle connected")
         
-        # Send control takeover command
-        drone_sock.sendall(b"CONTROL\n")
-        time.sleep(0.5)
-        logger.debug("Control established with Unity drone")
+        # Arm and takeoff to 10 meters
+        target_altitude = 10  # Adjust as needed
+        arm_and_takeoff(vehicle, target_altitude)
         
-    except Exception as e:
-        logger.warning(f"Could not connect to Unity drone controller: {e}")
+        # Give the drone a moment to stabilize at altitude
+        logger.info("Stabilizing at altitude...")
+        time.sleep(2)
+        
+        # Connect to Unity
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((MODEL_IP, MODEL_PORT))
+        logger.debug("Connected to Unity Model.")
+        
+        # Try to connect to drone controller (port 9001)
         drone_sock = None
-
-    try:
-        # Run localization with Unity control
-        localize(None, camera_sock, logger, thresh=0.12, unity_drone_sock=drone_sock)
+        try:
+            drone_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            drone_sock.connect((MODEL_IP, 9001))
+            logger.debug("Connected to Unity Drone Controller (port 9001)")
+            drone_sock.sendall(b"CONTROL\n")
+        except:
+            logger.warning("Could not connect to drone controller on port 9001")
+            drone_sock = None
+        
+        # Run localization
+        print("\nStarting localization loop...")
+        print("Press Ctrl+C to stop\n")
+        
+        # Run localization with real vehicle
+        localize(
+            vehicle,  # Using real vehicle
+            sock, 
+            logger, 
+            thresh=0.12,
+            lowered_alt=2,  # Descend to 2 meters when centered
+            descent_speed=0.2,
+            max_speed=0.3,
+            unity_drone_sock=drone_sock,
+            log_time_delay=0.5,  # More frequent logs
+            land=True  # Land when done
+        )
+        
+        # After localization completes, land if not already landed
+        logger.info("Localization complete, landing...")
+        if vehicle.armed:
+            vehicle.mode = VehicleMode("LAND")
+            
+        # Wait for landing
+        while vehicle.armed:
+            logger.info(f" Landing... Altitude: {vehicle.location.global_relative_frame.alt:.2f}")
+            time.sleep(1)
+            
+        logger.info("Landed successfully")
         
     except KeyboardInterrupt:
-        logger.debug("Shutting down...")
+        print("\n\nStopped by user")
+        # Attempt to land safely on interrupt
+        if 'vehicle' in locals() and vehicle.armed:
+            logger.info("Emergency landing...")
+            vehicle.mode = VehicleMode("LAND")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error in main: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # Release control
-        if drone_sock is not None:
+        # Cleanup
+        if 'vehicle' in locals():
+            vehicle.close()
+        if 'sock' in locals():
+            sock.close()
+        if 'drone_sock' in locals() and drone_sock:
             try:
                 drone_sock.sendall(b"RELEASE\n")
+                drone_sock.close()
             except:
                 pass
-            drone_sock.close()
-        camera_sock.close()
-
-
-"""
-
-def localize(
-        vehicle: Vehicle, 
-        sock: socket.socket, 
-        logger: logging.Logger, 
-        thresh=0.05, 
-        descent_speed=0.1,
-        lowered_alt=1,  
-        max_speed=0.2,
-        label_filter=lambda x: True,
-        duty_cycle=DT, 
-        camera_flip=False,
-        land=False, 
-        log_time_delay=1
-    ): 
-
-    test_mode = vehicle is None
-    if test_mode:
-        logger.warning("Vehicle is None — running TEST MODE (NO DRONE CONTROL).")
-        simulated_alt = 10.0  # Starting simulated altitude for test mode
-        simulated_position = [0.63, 0.51]  # Simulated viewport position
-
-    # Set WP_YAW_BEHAVIOR for real drone control
-    if not test_mode:
-        try:
-            previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
-            vehicle.parameters["WP_YAW_BEHAVIOR"] = 0
-            logger.debug("Set WP_YAW_BEHAVIOR to 0 for velocity control")
-        except Exception as e:
-            logger.warning(f"Could not set WP_YAW_BEHAVIOR: {e}")
-            previous_wp_behaviour = None
-    else:
-        previous_wp_behaviour = None
-
-    vx, vy, vz = 0, 0, 0
-    height_status = "not_lowering"  
-    localize_status = "localizing"  
-    log_timer_start = time.time()
-    
-    # Initialize Kalman Filter
-    kf = KalmanFilter()  
-    centered_start_time = None
-    centered_duration = 0
-
-    logger.debug(f"Localizing with parameters: thresh={thresh}, pickup_alt={lowered_alt}")
-
-    def debug(string): 
-        nonlocal log_timer_start
-        log_timer_start = debug_with_delay(lambda: logger.debug(string), log_timer_start, log_time_delay)
-
-    def baro_control(): 
-        nonlocal vz, height_status, log_timer_start
-        if test_mode:
-            # Test mode handling - simulate altitude
-            nonlocal simulated_alt
-            if height_status == "lowering":
-                simulated_alt -= descent_speed * (duty_cycle / 1000)
-                if simulated_alt <= lowered_alt:
-                    height_status = "lowered"
-                    vz = 0
-                    simulated_alt = lowered_alt
-                    debug(f"TEST MODE: Lowered to {lowered_alt} meters")
-        else:
-            # Real drone handling
-            if height_status == "lowering" and vehicle.location.global_relative_frame.alt <= lowered_alt: 
-                height_status = "lowered"
-                vz = 0
-                debug(f"Lowered to {lowered_alt} meters")
-    
-    def land_control(): 
-        nonlocal vz, height_status
-        if not test_mode and height_status == "lowering" and get_landed_state(vehicle) == "on_ground": 
-            height_status = 'lowered'
-            debug(f"Landing complete")
-            cut_throttle(vehicle, logger, 0.1)
-
-    # Add debug for centering
-    def check_centering(x_smooth, y_smooth):
-        nonlocal centered_start_time, centered_duration, localize_status
-        
-        # Handle None values - can't center without coordinates
-        if x_smooth is None or y_smooth is None:
-            if centered_start_time is not None:
-                debug(f"Lost centering after {time.time() - centered_start_time:.1f}s")
-            centered_start_time = None
-            centered_duration = 0
-            localize_status = "localizing"
-            return False
-        
-        x_error = abs(x_smooth - 0.5)
-        y_error = abs(y_smooth - 0.5)
-        centered = (x_error < thresh and y_error < thresh)
-        
-        if centered:
-            if centered_start_time is None:
-                centered_start_time = time.time()
-                debug(f"CENTERING STARTED: x_error={x_error:.3f}, y_error={y_error:.3f}")
-            else:
-                centered_duration = time.time() - centered_start_time
-                if centered_duration >= CENTERED_DURATION:
-                    localize_status = "localized"
-                    debug(f"CENTERED FOR {centered_duration:.1f}s - READY FOR DESCENT")
-                else:
-                    debug(f"Centering: {centered_duration:.1f}s (need {CENTERED_DURATION}s)")
-        else:
-            if centered_start_time is not None:
-                debug(f"Lost centering after {time.time() - centered_start_time:.1f}s")
-            centered_start_time = None
-            centered_duration = 0
-            localize_status = "localizing"
-        
-        return centered
-
-    # Update simulated position for test mode
-    def update_simulated_position(vx, vy, dt):
-        nonlocal simulated_position
-        if test_mode and simulated_position is not None:
-            # Simulate how the viewport coordinates would change
-            # When drone moves left (negative vx), x coordinate should decrease toward 0.5
-            simulated_position[0] += vx * dt * 0.1  # Scale factor for simulation
-            simulated_position[1] += vy * dt * 0.1
-            # Clamp to reasonable values
-            simulated_position[0] = max(0.1, min(0.9, simulated_position[0]))
-            simulated_position[1] = max(0.1, min(0.9, simulated_position[1]))
-
-    while True:
-        x_raw, y_raw = receive_coordinates(sock, label_filter)
-
-        # In test mode with no camera data, use simulated position
-        if test_mode and (x_raw is None or y_raw is None):
-            x_raw, y_raw = simulated_position[0], simulated_position[1]
-            debug(f"TEST MODE: Using simulated position ({x_raw:.3f}, {y_raw:.3f})")
-
-        if camera_flip and x_raw is not None:
-            x_raw = 1 - x_raw
-            y_raw = 1 - y_raw
-        
-        # APPLYING KF FILTER
-        x_smooth, y_smooth = kf.update(x_raw, y_raw)
-        
-        if x_smooth is not None and y_smooth is not None:
-            x_error = x_smooth - 0.5
-            y_error = 0.5 - y_smooth
-            
-            vx = GAIN * x_error
-            vy = GAIN * y_error
-            
-            # Apply flips
-            vx = -vx if FLIP_X else vx
-            vy = -vy if FLIP_Y else vy
-            
-            # Limit speed
-            vx = max(min(max_speed, vx), -max_speed)
-            vy = max(min(max_speed, vy), -max_speed)
-            
-            # Check if centered with detailed logging
-            centered = check_centering(x_smooth, y_smooth)
-            
-            if centered_duration >= CENTERED_DURATION:
-                vz = descent_speed
-                debug(f"Starting descent at {descent_speed} m/s")
-            
-            # Safe formatting for raw values
-            raw_x_str = f"{x_raw:.3f}" if x_raw is not None else "None"
-            raw_y_str = f"{y_raw:.3f}" if y_raw is not None else "None"
-            
-            debug(
-                f"Position: Raw=({raw_x_str},{raw_y_str}), "
-                f"Smooth=({x_smooth:.3f},{y_smooth:.3f}), "
-                f"Error=({x_error:.3f},{y_error:.3f}), "
-                f"Velocity=({vx:.3f},{vy:.3f},{vz:.3f})"
-            )
-            
-            # Update simulated position in test mode
-            if test_mode:
-                update_simulated_position(vx, vy, duty_cycle/1000)
-        else:
-            centered_start_time = None
-            centered_duration = 0
-            localize_status = "localizing"
-            debug("No detection - maintaining last known position")
-            vx, vy = 0, 0  # Stop horizontal movement when no detection
-    
-        if localize_status == "localized":
-            height_status = "lowering"
-        
-        if land:
-            land_control()
-        else:
-            baro_control()
-            
-        if height_status == "lowered" and localize_status == "localized": 
-            debug("Localization and descent complete")
-            break
-    
-        if not test_mode:
-            # Send velocity to REAL Ardupilot drone
-            send_velocity(vehicle, logger, vx, vy, vz)
-        else:
-            # Test mode - just log
-            if vx != 0 or vy != 0 or vz != 0:
-                alt = simulated_alt if 'simulated_alt' in locals() else "N/A"
-                debug(f"TEST MODE: Would send to Ardupilot - VX={vx:.3f}, VY={vy:.3f}, VZ={vz:.3f}, Alt={alt}m")
-        
-        time.sleep(duty_cycle / 1000)
-
-    # Restore WP_YAW_BEHAVIOR for real drone
-    if not test_mode and previous_wp_behaviour is not None:
-        try:
-            vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
-            logger.debug(f"Restored WP_YAW_BEHAVIOR to {previous_wp_behaviour}")
-        except Exception as e:
-            logger.warning(f"Could not restore WP_YAW_BEHAVIOR: {e}")
-            
-    logger.debug("Localization complete")
-
-def main():
-    # Connect to Unity camera
-    camera_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    camera_sock.connect((MODEL_IP, MODEL_PORT))
-    logger.debug("Connected to Unity Camera.")
-    
-    # Connect to Ardupilot (NOT Unity drone control)
-    vehicle = connect_to_ardupilot()
-    if vehicle is None:
-        logger.error("Could not connect to Ardupilot! Running in test mode.")
-        vehicle = None  # Test mode
-    
-    try:
-        # Run localization with REAL Ardupilot control
-        localize(vehicle, camera_sock, logger, thresh=0.12)
-        
-    except KeyboardInterrupt:
-        logger.debug("Shutting down...")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        camera_sock.close()
-        if vehicle is not None:
-            vehicle.close()
-        logger.debug("All connections closed")
-
+        print("\nScript ended")
 
 if __name__ == "__main__":
-    # Uncomment to run Kalman filter test
-    # test_kalman_filter()
-    
-    # Run main localization with Unity
     main()
