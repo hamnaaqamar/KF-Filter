@@ -256,7 +256,7 @@ def localize(
         descent_speed=0.1,
         detection_alt=4.0,
         landing_alt=0.3,
-        max_speed=0.2,
+        max_speed=0.3,  # Increased max speed
         label_filter=lambda x: True,
         duty_cycle=DT, 
         camera_flip=False,
@@ -311,15 +311,13 @@ def localize(
         
         if x_raw is not None and y_raw is not None:
             last_coordinates_time = time.time()
+            logger.debug(f"Raw Unity coordinates: ({x_raw:.3f}, {y_raw:.3f})")
         elif time.time() - last_coordinates_time > no_detection_timeout:
             debug("No detection for too long, resetting centering timer")
             centered_start_time = None
             centered_duration = 0
 
-        if camera_flip and x_raw is not None:
-            x_raw = 1 - x_raw
-            y_raw = 1 - y_raw
-        
+        # Apply Kalman filter
         x_smooth, y_smooth = kf.update(x_raw, y_raw)
         
         if not test_mode:
@@ -328,19 +326,48 @@ def localize(
             current_alt = simulated_alt
         
         if x_smooth is not None and y_smooth is not None:
-            x_error = x_smooth - 0.5
-            y_error = 0.5 - y_smooth
+            # Calculate errors from center
+            # Unity sends x (0-1 from left to right), y (0-1 from top to bottom?)
+            # We want the drone to move to center the target
             
-            vx = GAIN * x_error
-            vy = GAIN * y_error
+            # For a drone in GUIDED mode with MAV_FRAME_BODY_NED:
+            # Positive vx moves forward (North)
+            # Positive vy moves right (East)
+            # Positive vz moves down
             
-            vx = -vx if FLIP_X else vx
-            vy = -vy if FLIP_Y else vy
+            # Based on your Unity logs, when shape is at (0.506, 0.235):
+            # x_error = 0.506 - 0.5 = +0.006 (slightly right of center)
+            # y_error = 0.5 - 0.235 = +0.265 (way above center)
             
+            # So we need to move:
+            # - Slightly right (positive vy) to correct x_error
+            # - Forward (positive vx?) or backward? Let's determine:
+            
+            # If y_error is positive (target above center), drone needs to move forward
+            # If y_error is negative (target below center), drone needs to move backward
+            
+            x_error = x_smooth - 0.5  # Positive = target is right of center
+            y_error = y_smooth - 0.5  # Positive = target is above center? Let's check
+            
+            # Log the errors
+            logger.debug(f"Errors: x_err={x_error:.3f}, y_err={y_error:.3f}")
+            
+            # Calculate velocities
+            # For x_error positive (target right), move right (positive vy)
+            # For y_error positive (target above), move forward (positive vx)
+            
+            # Try this mapping:
+            vx = GAIN * y_error  # Forward/backward from y_error
+            vy = GAIN * x_error  # Left/right from x_error
+            
+            # Limit speed
             vx = max(min(max_speed, vx), -max_speed)
             vy = max(min(max_speed, vy), -max_speed)
             
-            centered = (abs(x_smooth - 0.5) < thresh and abs(y_smooth - 0.5) < thresh)
+            logger.debug(f"Calculated velocities: vx={vx:.3f}, vy={vy:.3f}")
+            
+            # Check if centered
+            centered = (abs(x_error) < thresh and abs(y_error) < thresh)
             
             if flight_phase == "hover_detection":
                 vz = 0
@@ -384,7 +411,8 @@ def localize(
                 f"Phase: {flight_phase}, "
                 f"Alt: {current_alt:.2f}m, "
                 f"Pos: ({x_smooth:.3f},{y_smooth:.3f}), "
-                f"Centered: {centered_duration:.1f}s"
+                f"Err: ({x_error:.3f},{y_error:.3f}), "
+                f"Vel: ({vx:.3f},{vy:.3f},{vz:.3f})"
             )
             
         else:
