@@ -252,7 +252,7 @@ def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
         logger: logging.Logger, 
-        thresh=0.08,  # 8% from center is acceptable
+        thresh=0.08,
         descent_speed=0.1,
         detection_alt=4.0,
         landing_alt=0.3,
@@ -276,10 +276,10 @@ def localize(
         previous_wp_behaviour = None
 
     # State variables
-    flight_phase = "searching"  # searching -> centering -> descending -> landed
+    flight_phase = "searching"
     log_timer_start = time.time()
     
-    # Kalman filter with conservative settings
+    # Kalman filter
     kf = KalmanFilter(process_noise=0.02, measurement_noise=0.15)
     
     # Centering variables
@@ -292,15 +292,15 @@ def localize(
     consecutive_detections = 0
     min_detections_for_centering = 2
     
-    # Store last known good position
+    # Store last known position
     last_good_x = 0.5
     last_good_y = 0.5
 
-    # Simple proportional control - DIRECT toward target
-    Kp = 0.4  # Gain
+    # Gain
+    Kp = 0.4
     
-    # Dead zone - stop moving when very close
-    dead_zone = 0.05
+    # Dead zone
+    dead_zone = 0.03
 
     # Get current altitude
     if not test_mode:
@@ -336,46 +336,48 @@ def localize(
         detection_valid = (x_raw is not None and y_raw is not None)
         
         if detection_valid:
-            # We have a detection!
             last_detection_time = current_time
             consecutive_detections += 1
             
-            # Apply Kalman filter
             x_smooth, y_smooth = kf.update(x_raw, y_raw)
             last_good_x, last_good_y = x_smooth, y_smooth
             
-            # Log raw and smoothed values
-            logger.debug(f"DETECT: raw=({x_raw:.3f},{y_raw:.3f}) smooth=({x_smooth:.3f},{y_smooth:.3f})")
-            
-            # Calculate errors from center (0.5, 0.5)
-            x_error = x_smooth - 0.5  # Positive = target is RIGHT of center
-            y_error = y_smooth - 0.5  # Positive = target is ABOVE center
+            # Calculate errors
+            x_error = x_smooth - 0.5
+            y_error = y_smooth - 0.5
             
             logger.debug(f"ERRORS: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # SIMPLE DIRECT CONTROL - Move directly toward the target
-            # If target is RIGHT (x_error > 0), move RIGHT (positive vy)
-            # If target is LEFT (x_error < 0), move LEFT (negative vy)
-            # If target is ABOVE (y_error > 0), move FORWARD (positive vx)
-            # If target is BELOW (y_error < 0), move BACKWARD (negative vx)
+            # ===== DIRECT VECTOR CONTROL =====
+            # Instead of controlling axes independently, control the vector directly
             
-            # Check if we're in dead zone
+            # Calculate desired direction
             if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
                 vx = 0
                 vy = 0
                 logger.debug("DEAD ZONE: stopped")
             else:
-                # DIRECT control - move in the direction of the error
-                vx = Kp * y_error   # Forward/back based on vertical error
-                vy = Kp * x_error   # Left/right based on horizontal error
+                # Calculate the angle to the target
+                angle_to_target = math.atan2(y_error, x_error)
                 
-                # Limit speed
-                vx = max(min(max_speed, vx), -max_speed)
-                vy = max(min(max_speed, vy), -max_speed)
+                # Convert to drone velocities
+                # In drone coordinates:
+                # - vx is forward/back (positive = forward)
+                # - vy is left/right (positive = right)
                 
-                logger.debug(f"DIRECT VEL: vx={vx:.3f}, vy={vy:.3f}")
+                # The drone should move in the direction that reduces the error
+                # If target is at angle θ, drone should move at angle θ
+                speed = Kp * math.sqrt(x_error**2 + y_error**2)
+                speed = min(max_speed, speed)
+                
+                vx = speed * math.sin(angle_to_target)  # Forward from y component
+                vy = speed * math.cos(angle_to_target)  # Right from x component
+                
+                logger.debug(f"ANGLE: {math.degrees(angle_to_target):.1f}°, SPEED: {speed:.3f}")
             
-            # Determine if we're centered
+            logger.debug(f"VECTOR VEL: vx={vx:.3f}, vy={vy:.3f}")
+            
+            # Determine if centered
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
             
             # STATE MACHINE
@@ -430,7 +432,7 @@ def localize(
                 logger.info("TARGET LOST - starting search pattern")
             
             if flight_phase == "searching":
-                # Simple back-and-forth search pattern
+                # Simple search pattern
                 search_step = int(current_time * 2) % 4
                 
                 if search_step == 0:
@@ -449,10 +451,6 @@ def localize(
                 vz = 0
                 logger.debug(f"SEARCH: step={search_step}")
                 
-            elif flight_phase == "centering" or flight_phase == "descending":
-                vx, vy, vz = 0, 0, 0
-                if time_since_detection > 1.0:
-                    logger.warning(f"Lost target during {flight_phase} - hovering")
             else:
                 vx, vy, vz = 0, 0, 0
         
@@ -475,7 +473,6 @@ def localize(
             if unity_drone_sock is not None:
                 send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
         
-        # Log current state
         debug(
             f"PHASE: {flight_phase}, "
             f"ALT: {current_alt:.2f}m, "
