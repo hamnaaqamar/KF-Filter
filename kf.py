@@ -38,15 +38,15 @@ class KalmanFilter:
         self.covariance = np.eye(4) * 0.1
         
         # Process and measurement noise
-        self.Q = np.eye(4) * process_noise  # Process noise
-        self.R = np.eye(2) * measurement_noise  # Measurement noise
+        self.Q = np.eye(4) * process_noise
+        self.R = np.eye(2) * measurement_noise
         
         # State transition matrix
         self.F = np.array([
-            [1, 0, 1, 0],  # x = x + vx
-            [0, 1, 0, 1],  # y = y + vy
-            [0, 0, 1, 0],  # vx stays same
-            [0, 0, 0, 1]   # vy stays same
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
         ])
         
         # Measurement matrix (we only measure x, y)
@@ -66,18 +66,15 @@ class KalmanFilter:
         self.F[0, 2] = dt
         self.F[1, 3] = dt
         
-        # PREDICT step (always happens)
+        # PREDICT step
         self.state = self.F @ self.state
         self.covariance = self.F @ self.covariance @ self.F.T + self.Q
         
-        # If no measurement, return predicted values
+        # If no measurement, return predicted position
         if camera_x is None or camera_y is None:
-            # Apply velocity damping when no measurement
-            self.state[2] *= 0.9  # Damp velocity in x
-            self.state[3] *= 0.9  # Damp velocity in y
             return float(self.state[0]), float(self.state[1])
         
-        # UPDATE step (camera measurement available)
+        # UPDATE step with measurement
         try:
             measurement = np.array([float(camera_x), float(camera_y)])
             
@@ -98,8 +95,11 @@ class KalmanFilter:
             print(f"Kalman filter update error: {e}")
         
         return float(self.state[0]), float(self.state[1])
-
-
+    
+    def get_velocity_estimate(self):
+        """Return the estimated velocity of the target"""
+        return float(self.state[2]), float(self.state[3])
+    
 def debug_with_delay(to_print: Callable[[], None], timer_start, delay): 
     if time.time() - timer_start <= delay: 
         to_print()
@@ -252,7 +252,7 @@ def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
         logger: logging.Logger, 
-        thresh=0.08,
+        thresh=0.08,  # 8% from center is acceptable
         descent_speed=0.1,
         detection_alt=4.0,
         landing_alt=0.3,
@@ -276,11 +276,13 @@ def localize(
         previous_wp_behaviour = None
 
     # State variables
-    flight_phase = "searching"
+    flight_phase = "searching"  # searching -> centering -> descending -> landed
     log_timer_start = time.time()
     
-    # Kalman filter
-    kf = KalmanFilter(process_noise=0.02, measurement_noise=0.15)
+    # Initialize Kalman filter with proper parameters
+    # process_noise: how much we trust our motion model (higher = more trust in predictions)
+    # measurement_noise: how much we trust camera measurements (higher = more trust in camera)
+    kf = KalmanFilter(process_noise=0.02, measurement_noise=0.1)
     
     # Centering variables
     centered_start_time = None
@@ -292,15 +294,21 @@ def localize(
     consecutive_detections = 0
     min_detections_for_centering = 2
     
-    # Store last known position
+    # Store last known good position
     last_good_x = 0.5
     last_good_y = 0.5
 
-    # Gain
-    Kp = 0.4
+    # Control gains
+    Kp = 0.4  # Proportional gain for position error
+    Kv = 0.2  # Velocity feedforward gain (to anticipate target motion)
     
-    # Dead zone
+    # Dead zone - stop when very close
     dead_zone = 0.03
+    
+    # Store previous errors for derivative control (optional)
+    prev_x_error = 0
+    prev_y_error = 0
+    dt_history = []
 
     # Get current altitude
     if not test_mode:
@@ -336,22 +344,38 @@ def localize(
         detection_valid = (x_raw is not None and y_raw is not None)
         
         if detection_valid:
+            # We have a detection! Update Kalman filter
             last_detection_time = current_time
             consecutive_detections += 1
             
+            # Kalman filter update with measurement
             x_smooth, y_smooth = kf.update(x_raw, y_raw)
+            
+            # Get estimated target velocity from Kalman filter
+            vx_target, vy_target = kf.get_velocity_estimate()
+            
+            # Store last known good position
             last_good_x, last_good_y = x_smooth, y_smooth
             
-            # Calculate errors
-            x_error = x_smooth - 0.5
-            y_error = y_smooth - 0.5
+            # Log raw and smoothed values
+            logger.debug(f"DETECT: raw=({x_raw:.3f},{y_raw:.3f}) smooth=({x_smooth:.3f},{y_smooth:.3f})")
+            logger.debug(f"TARGET VEL: vx={vx_target:.3f}, vy={vy_target:.3f}")
+            
+            # Calculate errors from center (0.5, 0.5)
+            x_error = x_smooth - 0.5  # Positive = target is RIGHT of center
+            y_error = y_smooth - 0.5  # Positive = target is ABOVE center
             
             logger.debug(f"ERRORS: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # ===== FIXED VECTOR CONTROL =====
-            # The previous formula was wrong - we need to move directly toward the target
+            # Calculate time delta for derivative
+            dt = duty_cycle / 1000.0
+            
+            # ===== KALMAN-BASED CONTROL =====
+            # This uses both position error and estimated target velocity
+            # to create a smoother, more anticipatory control
             
             if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
+                # In dead zone - stop moving
                 vx = 0
                 vy = 0
                 logger.debug("DEAD ZONE: stopped")
@@ -359,40 +383,58 @@ def localize(
                 # Calculate distance to target
                 distance = math.sqrt(x_error**2 + y_error**2)
                 
-                # Calculate speed based on distance (slower when closer)
-                speed = Kp * distance
-                speed = min(max_speed, speed)
+                # Base speed on distance (proportional control)
+                base_speed = Kp * distance
+                base_speed = min(max_speed, base_speed)
                 
-                # Calculate direction to target
-                # We want to move in the direction that REDUCES the error
-                # If target is right (x_error > 0), move right (positive vy)
-                # If target is above (y_error > 0), move forward (positive vx)
-                
-                # Normalize the error vector to get direction
+                # Calculate direction to target (normalized error vector)
                 if distance > 0:
-                    # Move in the direction of the error
-                    vx = speed * (y_error / distance)  # Forward/back from y_error
-                    vy = speed * (x_error / distance)  # Left/right from x_error
+                    dir_x = y_error / distance  # Forward/back component
+                    dir_y = x_error / distance  # Left/right component
                 else:
-                    vx = 0
-                    vy = 0
+                    dir_x = 0
+                    dir_y = 0
                 
-                logger.debug(f"DISTANCE: {distance:.3f}, SPEED: {speed:.3f}")
-                logger.debug(f"DIRECTION: vx={vx:.3f}, vy={vy:.3f}")
+                # Position-based velocity (move toward target)
+                vx_pos = base_speed * dir_x
+                vy_pos = base_speed * dir_y
+                
+                # Velocity feedforward (anticipate target motion)
+                # If the target is moving, we add a component to match its motion
+                vx_ff = Kv * vx_target
+                vy_ff = Kv * vy_target
+                
+                # Combine position control and feedforward
+                vx = vx_pos + vx_ff
+                vy = vy_pos + vy_ff
+                
+                # Limit speed
+                vx = max(min(max_speed, vx), -max_speed)
+                vy = max(min(max_speed, vy), -max_speed)
+                
+                logger.debug(f"DISTANCE: {distance:.3f}")
+                logger.debug(f"POS VEL: ({vx_pos:.3f},{vy_pos:.3f})")
+                logger.debug(f"FF VEL: ({vx_ff:.3f},{vy_ff:.3f})")
+                logger.debug(f"FINAL VEL: ({vx:.3f},{vy:.3f})")
             
-            # Determine if centered
+            # Store errors for next iteration
+            prev_x_error = x_error
+            prev_y_error = y_error
+            
+            # Determine if we're centered
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
             
             # STATE MACHINE
             if flight_phase == "searching":
+                # Found target while searching
                 if consecutive_detections >= min_detections_for_centering:
                     flight_phase = "centering"
                     centered_start_time = None
                     logger.info(f"TARGET FOUND - beginning centering")
-                vz = 0
+                vz = 0  # Hold altitude
                 
             elif flight_phase == "centering":
-                vz = 0
+                vz = 0  # Hold altitude while centering
                 
                 if centered:
                     if centered_start_time is None:
@@ -408,6 +450,7 @@ def localize(
                     centered_duration = 0
                     
             elif flight_phase == "descending":
+                # Maintain center while descending
                 if current_alt <= landing_alt + 0.2:
                     flight_phase = "landed"
                     vz = 0
@@ -424,18 +467,25 @@ def localize(
                 break
                 
         else:
-            # NO DETECTION
+            # NO DETECTION - Kalman filter predicts position
             consecutive_detections = 0
             time_since_detection = current_time - last_detection_time
             
+            # Get predicted position from Kalman filter (it handles None internally)
+            x_pred, y_pred = kf.update(None, None)
+            
             logger.debug(f"NO DETECT: {time_since_detection:.1f}s since last detection")
+            logger.debug(f"KALMAN PRED: ({x_pred:.3f},{y_pred:.3f})")
             
-            if time_since_detection > detection_timeout and flight_phase != "searching":
-                flight_phase = "searching"
-                logger.info("TARGET LOST - starting search pattern")
+            # Check if we've lost the target for too long
+            if time_since_detection > detection_timeout:
+                if flight_phase != "searching":
+                    flight_phase = "searching"
+                    logger.info("TARGET LOST - starting search pattern")
             
+            # Set velocities based on phase
             if flight_phase == "searching":
-                # Simple search pattern
+                # Simple search pattern - move in a square
                 search_step = int(current_time * 2) % 4
                 
                 if search_step == 0:
@@ -454,10 +504,20 @@ def localize(
                 vz = 0
                 logger.debug(f"SEARCH: step={search_step}")
                 
+            elif flight_phase == "centering" or flight_phase == "descending":
+                # Lost target during critical phase - stop and wait briefly
+                if time_since_detection < 2.0:
+                    vx, vy, vz = 0, 0, 0
+                    logger.debug(f"Lost target during {flight_phase} - waiting")
+                else:
+                    # After waiting, go back to search
+                    flight_phase = "searching"
+                    logger.info("Target lost during critical phase - switching to search")
+                    vx, vy, vz = 0, 0, 0
             else:
                 vx, vy, vz = 0, 0, 0
         
-        # Safety check
+        # Safety check - if we're descending and very low, just land
         if flight_phase == "descending" and current_alt <= 0.3:
             logger.info("VERY LOW ALTITUDE - forcing land")
             flight_phase = "landed"
@@ -476,11 +536,19 @@ def localize(
             if unity_drone_sock is not None:
                 send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
         
-        debug(
-            f"PHASE: {flight_phase}, "
-            f"ALT: {current_alt:.2f}m, "
-            f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
-        )
+        # Log current state periodically
+        if int(current_time * 2) % 10 == 0:  # Log every ~5 seconds
+            logger.info(
+                f"PHASE: {flight_phase}, "
+                f"ALT: {current_alt:.2f}m, "
+                f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
+            )
+        else:
+            debug(
+                f"PHASE: {flight_phase}, "
+                f"ALT: {current_alt:.2f}m, "
+                f"VEL: ({vx:.3f},{vy:.3f},{vz:.3f})"
+            )
         
         time.sleep(duty_cycle / 1000)
 
