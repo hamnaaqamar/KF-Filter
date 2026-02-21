@@ -256,7 +256,7 @@ def localize(
         descent_speed=0.1,
         detection_alt=4.0,
         landing_alt=0.3,
-        max_speed=0.3,  # Increased max speed
+        max_speed=0.3,
         label_filter=lambda x: True,
         duty_cycle=DT, 
         camera_flip=False,
@@ -282,8 +282,14 @@ def localize(
     kf = KalmanFilter()  
     centered_start_time = None
     centered_duration = 0
-    last_coordinates_time = time.time()
-    no_detection_timeout = 3.0
+    last_detection_time = time.time()
+    search_pattern_start = 0
+    search_direction = 1  # 1 for clockwise, -1 for counter-clockwise
+    
+    # Search pattern parameters
+    search_radius = 0.2  # How far to move in search pattern
+    search_speed = 0.15   # Speed during search
+    search_phase = 0      # Current angle in search circle
 
     if not test_mode:
         current_alt = vehicle.location.global_relative_frame.alt
@@ -309,54 +315,28 @@ def localize(
         # Get coordinates from Unity
         x_raw, y_raw = receive_coordinates(sock, label_filter)
         
+        current_time = time.time()
+        
         if x_raw is not None and y_raw is not None:
-            last_coordinates_time = time.time()
+            # Target detected!
+            last_detection_time = current_time
+            search_pattern_start = 0  # Reset search pattern
+            
             logger.debug(f"Raw Unity coordinates: ({x_raw:.3f}, {y_raw:.3f})")
-        elif time.time() - last_coordinates_time > no_detection_timeout:
-            debug("No detection for too long, resetting centering timer")
-            centered_start_time = None
-            centered_duration = 0
-
-        # Apply Kalman filter
-        x_smooth, y_smooth = kf.update(x_raw, y_raw)
-        
-        if not test_mode:
-            current_alt = vehicle.location.global_relative_frame.alt
-        else:
-            current_alt = simulated_alt
-        
-        if x_smooth is not None and y_smooth is not None:
+            
+            if camera_flip:
+                x_raw = 1 - x_raw
+                y_raw = 1 - y_raw
+            
+            x_smooth, y_smooth = kf.update(x_raw, y_raw)
+            
             # Calculate errors from center
-            # Unity sends x (0-1 from left to right), y (0-1 from top to bottom?)
-            # We want the drone to move to center the target
+            x_error = x_smooth - 0.5
+            y_error = y_smooth - 0.5
             
-            # For a drone in GUIDED mode with MAV_FRAME_BODY_NED:
-            # Positive vx moves forward (North)
-            # Positive vy moves right (East)
-            # Positive vz moves down
-            
-            # Based on your Unity logs, when shape is at (0.506, 0.235):
-            # x_error = 0.506 - 0.5 = +0.006 (slightly right of center)
-            # y_error = 0.5 - 0.235 = +0.265 (way above center)
-            
-            # So we need to move:
-            # - Slightly right (positive vy) to correct x_error
-            # - Forward (positive vx?) or backward? Let's determine:
-            
-            # If y_error is positive (target above center), drone needs to move forward
-            # If y_error is negative (target below center), drone needs to move backward
-            
-            x_error = x_smooth - 0.5  # Positive = target is right of center
-            y_error = y_smooth - 0.5  # Positive = target is above center? Let's check
-            
-            # Log the errors
             logger.debug(f"Errors: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # Calculate velocities
-            # For x_error positive (target right), move right (positive vy)
-            # For y_error positive (target above), move forward (positive vx)
-            
-            # Try this mapping:
+            # Calculate velocities based on errors
             vx = GAIN * y_error  # Forward/backward from y_error
             vy = GAIN * x_error  # Left/right from x_error
             
@@ -364,7 +344,7 @@ def localize(
             vx = max(min(max_speed, vx), -max_speed)
             vy = max(min(max_speed, vy), -max_speed)
             
-            logger.debug(f"Calculated velocities: vx={vx:.3f}, vy={vy:.3f}")
+            logger.debug(f"Tracking velocities: vx={vx:.3f}, vy={vy:.3f}")
             
             # Check if centered
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
@@ -374,10 +354,10 @@ def localize(
                 
                 if centered:
                     if centered_start_time is None:
-                        centered_start_time = time.time()
-                        logger.info("Target detected, starting centering timer")
+                        centered_start_time = current_time
+                        logger.info("Target centered, starting centering timer")
                     else:
-                        centered_duration = time.time() - centered_start_time
+                        centered_duration = current_time - centered_start_time
                     
                     if centered_duration >= CENTERED_DURATION:
                         flight_phase = "centered"
@@ -407,29 +387,47 @@ def localize(
                 logger.info("Landed on target")
                 break
                 
-            debug(
-                f"Phase: {flight_phase}, "
-                f"Alt: {current_alt:.2f}m, "
-                f"Pos: ({x_smooth:.3f},{y_smooth:.3f}), "
-                f"Err: ({x_error:.3f},{y_error:.3f}), "
-                f"Vel: ({vx:.3f},{vy:.3f},{vz:.3f})"
-            )
-            
         else:
+            # No detection - enter search pattern
             centered_start_time = None
             centered_duration = 0
             
-            if flight_phase == "hover_detection":
+            time_since_detection = current_time - last_detection_time
+            
+            if time_since_detection < 2.0:
+                # Just lost target, hover in place briefly
                 vx, vy, vz = 0, 0, 0
-                debug(f"No detection - hovering at {current_alt:.2f}m")
-            elif flight_phase == "descending":
-                vx, vy = 0, 0
-                vz = descent_speed * 0.5
-                debug(f"No detection during descent - descending slowly")
+                debug(f"Target lost - hovering ({(2.0 - time_since_detection):.1f}s until search)")
+            else:
+                # Enter search pattern
+                if search_pattern_start == 0:
+                    search_pattern_start = current_time
+                    search_phase = 0
+                    logger.info("Starting search pattern - target lost")
+                
+                # Spiral search pattern
+                search_duration = current_time - search_pattern_start
+                
+                # Increase radius slowly over time
+                current_radius = min(search_radius, 0.05 + search_duration * 0.02)
+                
+                # Calculate search velocity (circle pattern)
+                search_phase += 0.05 * duty_cycle / 100  # Rotate slowly
+                vx = search_speed * math.cos(search_phase) * current_radius * 5
+                vy = search_speed * math.sin(search_phase) * current_radius * 5
+                vz = 0
+                
+                debug(f"Searching: radius={current_radius:.2f}, phase={search_phase:.1f}")
         
+        # Get current altitude
+        if not test_mode:
+            current_alt = vehicle.location.global_relative_frame.alt
+        
+        # Send velocity commands
         if not test_mode:
             send_velocity(vehicle, logger, vx, vy, vz)
             
+            # Safety checks
             if flight_phase == "descending" and current_alt <= 0.2:
                 logger.info("Very low altitude - forcing land")
                 vehicle.mode = VehicleMode("LAND")
