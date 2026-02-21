@@ -252,11 +252,11 @@ def localize(
         vehicle: Vehicle, 
         sock: socket.socket, 
         logger: logging.Logger, 
-        thresh=0.08,  # Slightly increased threshold (8% from center)
-        descent_speed=0.12,  # Slower descent
+        thresh=0.1,  # 10% from center is acceptable
+        descent_speed=0.1,  # Slower descent
         detection_alt=4.0,
         landing_alt=0.3,
-        max_speed=0.15,  # Reduced max speed to prevent overshoot
+        max_speed=0.12,  # Much slower max speed (was 0.15)
         label_filter=lambda x: True,
         duty_cycle=DT, 
         camera_flip=False,
@@ -290,30 +290,17 @@ def localize(
     last_detection_time = time.time()
     detection_timeout = 3.0
     consecutive_detections = 0
-    min_detections_for_centering = 3  # Need multiple detections to trust centering
+    min_detections_for_centering = 2  # Need 2 detections to trust centering
     
     # Store last known good position
     last_good_x = 0.5
     last_good_y = 0.5
 
-    # PID Control variables
-    integral_x = 0
-    integral_y = 0
-    prev_x_error = 0
-    prev_y_error = 0
-    prev_vx = 0
-    prev_vy = 0
-    
-    # PID gains - tuned for stable tracking
-    Kp = 0.25  # Proportional gain (reduced from 0.8)
-    Ki = 0.02  # Integral gain (small to eliminate steady-state error)
-    Kd = 0.15  # Derivative gain (damping to prevent oscillations)
+    # Simple P controller (no PID to keep it simple)
+    Kp = 0.3  # Proportional gain (reduced from 0.8)
     
     # Dead zone - stop moving when very close
-    dead_zone = 0.03  # 3% dead zone
-    
-    # Velocity smoothing factor (0 = no smoothing, 1 = instant, lower = smoother)
-    smoothing = 0.3  # Take 30% of new velocity, 70% of previous
+    dead_zone = 0.05  # 5% dead zone
 
     # Get current altitude
     if not test_mode:
@@ -331,13 +318,10 @@ def localize(
     # Descend to detection altitude if needed
     if not test_mode and current_alt > detection_alt + 0.5:
         logger.info(f"Descending to detection altitude {detection_alt}m...")
-        start_alt = current_alt
         while vehicle.location.global_relative_frame.alt > detection_alt + 0.15:
             send_velocity(vehicle, logger, 0, 0, 0.1)
             time.sleep(duty_cycle / 1000)
-            current_alt = vehicle.location.global_relative_frame.alt
-            debug(f"Descending: {current_alt:.2f}m -> {detection_alt}m")
-        logger.info(f"Reached detection altitude: {current_alt:.2f}m")
+        logger.info(f"Reached detection altitude")
 
     while True:
         # Get coordinates from Unity
@@ -369,59 +353,25 @@ def localize(
             
             logger.debug(f"ERRORS: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # ===== PID CONTROLLER WITH DEAD ZONE =====
+            # SIMPLE CONTROL - just proportional
+            # Move in the direction that reduces the error
             
             # Check if we're in dead zone (very close to center)
             if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
                 # In dead zone - stop moving
                 vx = 0
                 vy = 0
-                # Reset integral to prevent windup
-                integral_x = 0
-                integral_y = 0
                 logger.debug("DEAD ZONE: stopped")
             else:
-                # Update integral (with anti-windup)
-                integral_x += x_error * (duty_cycle / 1000)
-                integral_y += y_error * (duty_cycle / 1000)
+                # Simple P controller
+                vx = Kp * y_error   # Forward/back from vertical error
+                vy = Kp * x_error   # Left/right from horizontal error
                 
-                # Limit integral windup to prevent excessive buildup
-                integral_x = max(min(integral_x, 0.3), -0.3)
-                integral_y = max(min(integral_y, 0.3), -0.3)
+                # Limit speed
+                vx = max(min(max_speed, vx), -max_speed)
+                vy = max(min(max_speed, vy), -max_speed)
                 
-                # Calculate derivative (rate of change of error)
-                dt = duty_cycle / 1000
-                if dt > 0:
-                    derivative_x = (x_error - prev_x_error) / dt
-                    derivative_y = (y_error - prev_y_error) / dt
-                else:
-                    derivative_x = 0
-                    derivative_y = 0
-                
-                # PID output
-                # Note: vx controls forward/back (from y_error), vy controls left/right (from x_error)
-                vx_desired = Kp * y_error + Ki * integral_y + Kd * derivative_y
-                vy_desired = Kp * x_error + Ki * integral_x + Kd * derivative_x
-                
-                # Limit desired speed
-                vx_desired = max(min(max_speed, vx_desired), -max_speed)
-                vy_desired = max(min(max_speed, vy_desired), -max_speed)
-                
-                # Apply velocity smoothing to prevent jerky movements
-                vx = smoothing * vx_desired + (1 - smoothing) * prev_vx
-                vy = smoothing * vy_desired + (1 - smoothing) * prev_vy
-                
-                # Store for next iteration
-                prev_vx = vx
-                prev_vy = vy
-                prev_x_error = x_error
-                prev_y_error = y_error
-                
-                logger.debug(f"PID: P({Kp*y_error:.3f},{Kp*x_error:.3f}) "
-                           f"I({Ki*integral_y:.3f},{Ki*integral_x:.3f}) "
-                           f"D({Kd*derivative_y:.3f},{Kd*derivative_x:.3f})")
-                logger.debug(f"DESIRED: ({vx_desired:.3f},{vy_desired:.3f}) "
-                           f"SMOOTHED: ({vx:.3f},{vy:.3f})")
+                logger.debug(f"VEL: vx={vx:.3f}, vy={vy:.3f}")
             
             # Determine if we're centered (using threshold, not dead zone)
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
@@ -432,11 +382,6 @@ def localize(
                 if consecutive_detections >= min_detections_for_centering:
                     flight_phase = "centering"
                     centered_start_time = None
-                    # Reset PID when switching phases
-                    integral_x = 0
-                    integral_y = 0
-                    prev_x_error = x_error
-                    prev_y_error = y_error
                     logger.info(f"TARGET FOUND - beginning centering (after {consecutive_detections} detections)")
                 vz = 0  # Hold altitude
                 
@@ -446,7 +391,7 @@ def localize(
                 if centered:
                     if centered_start_time is None:
                         centered_start_time = current_time
-                        logger.info(f"Target centered - starting timer (errors: {x_error:.3f},{y_error:.3f})")
+                        logger.info(f"Target centered - starting timer")
                     else:
                         centered_duration = current_time - centered_start_time
                         if centered_duration >= CENTERED_DURATION:
@@ -484,38 +429,34 @@ def localize(
             if time_since_detection > detection_timeout:
                 if flight_phase != "searching":
                     flight_phase = "searching"
-                    # Reset PID when starting search
-                    integral_x = 0
-                    integral_y = 0
-                    prev_x_error = 0
-                    prev_y_error = 0
-                    prev_vx = 0
-                    prev_vy = 0
                     logger.info("TARGET LOST - starting search pattern")
             
             # Set velocities based on phase
             if flight_phase == "searching":
-                # Simple search pattern - spiral outward slowly
-                # Use last known good position as center for search
-                search_radius = min(0.25, 0.05 + time_since_detection * 0.03)
-                search_angle = current_time * 0.3  # Rotate slowly
+                # Simple back-and-forth search pattern
+                # Move in a small square pattern to find the target
+                search_step = int(current_time * 2) % 4
                 
-                # Search in a spiral pattern
-                vx = 0.08 * math.cos(search_angle) * search_radius * 3
-                vy = 0.08 * math.sin(search_angle) * search_radius * 3
+                if search_step == 0:
+                    vx = 0.08  # Move forward
+                    vy = 0
+                elif search_step == 1:
+                    vx = 0
+                    vy = 0.08  # Move right
+                elif search_step == 2:
+                    vx = -0.08  # Move back
+                else:
+                    vx = 0
+                    vy = -0.08  # Move left
+                
                 vz = 0
-                
-                # Limit search speed
-                vx = max(min(0.1, vx), -0.1)
-                vy = max(min(0.1, vy), -0.1)
-                
-                logger.debug(f"SEARCH: radius={search_radius:.2f}, angle={search_angle:.1f}")
+                logger.debug(f"SEARCH: step={search_step}")
                 
             elif flight_phase == "centering":
                 # Lost target during centering - stop and wait briefly
-                if time_since_detection < 1.0:
+                if time_since_detection < 2.0:
                     vx, vy, vz = 0, 0, 0
-                    logger.debug(f"Lost target during centering - waiting ({1.0-time_since_detection:.1f}s)")
+                    logger.debug(f"Lost target during centering - waiting")
                 else:
                     # After waiting, go back to search
                     flight_phase = "searching"
@@ -526,7 +467,7 @@ def localize(
                 # Lost target during descent - stop descending and hover
                 vx, vy, vz = 0, 0, 0
                 if time_since_detection > 1.0:
-                    logger.warning(f"Lost target during descent - hovering at {current_alt:.2f}m")
+                    logger.warning(f"Lost target during descent - hovering")
             else:
                 vx, vy, vz = 0, 0, 0
         
@@ -568,7 +509,7 @@ def localize(
     if not test_mode:
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
     logger.info("Localization complete")
-
+    
 def test_unity_connection():
     """Test Unity connection and return a new socket"""
     print("\n" + "="*60)
