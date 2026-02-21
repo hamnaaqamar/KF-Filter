@@ -348,34 +348,37 @@ def localize(
             
             logger.debug(f"ERRORS: x_err={x_error:.3f}, y_err={y_error:.3f}")
             
-            # ===== DIRECT VECTOR CONTROL =====
-            # Instead of controlling axes independently, control the vector directly
+            # ===== FIXED VECTOR CONTROL =====
+            # The previous formula was wrong - we need to move directly toward the target
             
-            # Calculate desired direction
             if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
                 vx = 0
                 vy = 0
                 logger.debug("DEAD ZONE: stopped")
             else:
-                # Calculate the angle to the target
-                angle_to_target = math.atan2(y_error, x_error)
+                # Calculate distance to target
+                distance = math.sqrt(x_error**2 + y_error**2)
                 
-                # Convert to drone velocities
-                # In drone coordinates:
-                # - vx is forward/back (positive = forward)
-                # - vy is left/right (positive = right)
-                
-                # The drone should move in the direction that reduces the error
-                # If target is at angle θ, drone should move at angle θ
-                speed = Kp * math.sqrt(x_error**2 + y_error**2)
+                # Calculate speed based on distance (slower when closer)
+                speed = Kp * distance
                 speed = min(max_speed, speed)
                 
-                vx = speed * math.sin(angle_to_target)  # Forward from y component
-                vy = speed * math.cos(angle_to_target)  # Right from x component
+                # Calculate direction to target
+                # We want to move in the direction that REDUCES the error
+                # If target is right (x_error > 0), move right (positive vy)
+                # If target is above (y_error > 0), move forward (positive vx)
                 
-                logger.debug(f"ANGLE: {math.degrees(angle_to_target):.1f}°, SPEED: {speed:.3f}")
-            
-            logger.debug(f"VECTOR VEL: vx={vx:.3f}, vy={vy:.3f}")
+                # Normalize the error vector to get direction
+                if distance > 0:
+                    # Move in the direction of the error
+                    vx = speed * (y_error / distance)  # Forward/back from y_error
+                    vy = speed * (x_error / distance)  # Left/right from x_error
+                else:
+                    vx = 0
+                    vy = 0
+                
+                logger.debug(f"DISTANCE: {distance:.3f}, SPEED: {speed:.3f}")
+                logger.debug(f"DIRECTION: vx={vx:.3f}, vy={vy:.3f}")
             
             # Determine if centered
             centered = (abs(x_error) < thresh and abs(y_error) < thresh)
@@ -484,7 +487,7 @@ def localize(
     if not test_mode:
         vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
     logger.info("Localization complete")
-
+    
 def test_unity_connection():
     """Test Unity connection and return a new socket"""
     print("\n" + "="*60)
