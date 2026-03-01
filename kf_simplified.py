@@ -263,260 +263,126 @@ def control_from_image_error(
 
 
 def localize(
-    vehicle: Optional[Vehicle],
+    vehicle: Vehicle,
     sock: socket.socket,
     log: logging.Logger,
     thresh: float = 0.08,
-    descent_speed: float = 0.1,
-    detection_alt: float = 4.0,
+    descent_speed: float = 0.15,
     landing_alt: float = 0.3,
-    max_speed: float = 0.15,
-    label_filter: Callable[[dict], bool] = lambda _: True,
+    max_speed: float = 0.2,
     duty_cycle: int = DT,
-    log_time_delay: float = 1.0,
-    unity_drone_sock: Optional[socket.socket] = None,
 ) -> None:
-    test_mode = vehicle is None
-    if test_mode:
-        log.warning("Vehicle is None — running UNITY TEST MODE.")
-        simulated_alt = 5.0
 
-    previous_wp_behaviour = None
-    if not test_mode:
-        previous_wp_behaviour = vehicle.parameters["WP_YAW_BEHAVIOR"]
-        vehicle.parameters["WP_YAW_BEHAVIOR"] = 0
+    log.info("Starting simple localization...")
 
-    # Simplified flow: center over target first, then descend.
-    flight_phase = "centering"
-    log_timer_start = time.time()
-
-    kf = KalmanFilter(process_noise=0.02, measurement_noise=0.1)
+    kf = KalmanFilter()
     centered_start_time = None
     last_detection_time = time.time()
 
-    # Separate gains can help if one axis is more sluggish.
-    kp_x = 0.5
-    kp_y = 0.5
-    dead_zone = 0.05
-    # Use stricter centering before initiating descent.
-    descent_entry_thresh = max(0.05, min(thresh, 0.08))
-    # During descent, pause/abort descent if target drifts too far.
-    descent_track_thresh = max(descent_entry_thresh + 0.04, 0.12)
-    descent_abort_thresh = max(descent_entry_thresh + 0.16, 0.22)
-
-    if not test_mode:
-        current_alt = vehicle.location.global_relative_frame.alt
-        log.info("Starting at altitude: %.2fm", current_alt)
-        log.info("Target detection altitude: %.2fm", detection_alt)
-    else:
-        current_alt = simulated_alt
-
-    # Descend to detection altitude.
-    if not test_mode and current_alt > detection_alt + 0.5:
-        log.info("Descending to detection altitude %.2fm...", detection_alt)
-        while vehicle.location.global_relative_frame.alt > detection_alt + 0.15:
-            send_velocity(vehicle, log, 0.0, 0.0, abs(descent_speed))
-            time.sleep(duty_cycle / 1000.0)
-        log.info("Reached detection altitude")
-
+    # Excel logging
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "localization"
-    sheet.append(
-        [
-            "timestamp",
-            "elapsed_s",
-            "phase",
-            "tracking_source",
-            "detection_valid",
-            "alt_m",
-            "x_raw",
-            "y_raw",
-            "x_est",
-            "y_est",
-            "x_err",
-            "y_err",
-            "vx",
-            "vy",
-            "vz",
-            "centered",
-            "ready_to_descend",
-        ]
-    )
+    sheet.append([
+        "timestamp",
+        "elapsed_s",
+        "alt_m",
+        "x_raw",
+        "y_raw",
+        "x_est",
+        "y_est",
+        "x_err",
+        "y_err",
+        "vx",
+        "vy",
+        "vz",
+        "centered",
+    ])
 
     start_time = time.time()
-    last_xlsx_save = start_time
+    last_save = start_time
+
     try:
         while True:
             now = time.time()
-            if not test_mode:
-                current_alt = vehicle.location.global_relative_frame.alt
-            else:
-                current_alt = simulated_alt
+            alt = vehicle.location.global_relative_frame.alt
 
-            x_raw, y_raw = receive_coordinates(sock, label_filter)
+            x_raw, y_raw = receive_coordinates(sock, lambda _: True)
             detection_valid = x_raw is not None and y_raw is not None
-            tracking_source = "lost"
 
-            vx, vy, vz = 0.0, 0.0, 0.0
-            centered = False
-            ready_to_descend = False
-            x_error = float("nan")
-            y_error = float("nan")
-            x_est = None
-            y_est = None
-
+            # ---------- KALMAN ----------
             if detection_valid:
                 last_detection_time = now
                 x_est, y_est = kf.update(x_raw, y_raw)
-                tracking_source = "detect"
             elif now - last_detection_time <= DROPOUT_PREDICT_SEC:
                 x_est, y_est = kf.update(None, None)
-                tracking_source = "predict"
+            else:
+                x_est, y_est = None, None
+
+            vx, vy, vz = 0.0, 0.0, 0.0
+            centered = False
+            x_error = float("nan")
+            y_error = float("nan")
 
             if x_est is not None and y_est is not None:
+
+                # ---------- CENTERING ----------
                 x_error_raw = x_est - 0.5
                 y_error_raw = y_est - 0.5
+
                 vx, vy, x_error, y_error = control_from_image_error(
-                    x_error_raw=x_error_raw,
-                    y_error_raw=y_error_raw,
-                    kp_x=kp_x,
-                    kp_y=kp_y,
+                    x_error_raw,
+                    y_error_raw,
+                    kp_x=0.5,
+                    kp_y=0.5,
                     max_speed=max_speed,
                 )
+
                 centered = abs(x_error) < thresh and abs(y_error) < thresh
-                ready_to_descend = abs(x_error) < descent_entry_thresh and abs(y_error) < descent_entry_thresh
 
-                if abs(x_error) < dead_zone and abs(y_error) < dead_zone:
-                    vx, vy = 0.0, 0.0
-
-                if tracking_source == "detect":
-                    log.debug(
-                        "DETECT raw=(%.3f,%.3f) err=(%.3f,%.3f) vel=(%.3f,%.3f)",
-                        x_est,
-                        y_est,
-                        x_error,
-                        y_error,
-                        vx,
-                        vy,
-                    )
+                if centered:
+                    if centered_start_time is None:
+                        centered_start_time = now
+                    elif now - centered_start_time >= CENTERED_DURATION:
+                        vz = descent_speed
                 else:
-                    log.debug(
-                        "PREDICT est=(%.3f,%.3f) err=(%.3f,%.3f) vel=(%.3f,%.3f)",
-                        x_est,
-                        y_est,
-                        x_error,
-                        y_error,
-                        vx,
-                        vy,
-                    )
+                    centered_start_time = None
 
-                if flight_phase == "centering":
-                    if ready_to_descend:
-                        if centered_start_time is None:
-                            centered_start_time = now
-                            log.info("CENTERED - timer started")
-                        elif now - centered_start_time >= CENTERED_DURATION:
-                            flight_phase = "descending"
-                            log.info("DESCENDING")
-                    else:
-                        centered_start_time = None
-                elif flight_phase == "descending":
-                    if current_alt <= landing_alt + 0.2:
-                        flight_phase = "landed"
-                        vx, vy, vz = 0.0, 0.0, 0.0
-                        log.info("LANDED")
-                    else:
-                        abs_x, abs_y = abs(x_error), abs(y_error)
-                        if abs_x > descent_abort_thresh or abs_y > descent_abort_thresh:
-                            flight_phase = "centering"
-                            centered_start_time = None
-                            vz = 0.0
-                            log.warning(
-                                "DESCENT ABORTED: large offset (|ex|=%.3f, |ey|=%.3f). Re-centering.",
-                                abs_x,
-                                abs_y,
-                            )
-                        elif abs_x > descent_track_thresh or abs_y > descent_track_thresh:
-                            vz = 0.0
-                            log.debug(
-                                "DESCENT PAUSED: offset too large for safe descend (|ex|=%.3f, |ey|=%.3f).",
-                                abs_x,
-                                abs_y,
-                            )
-                        else:
-                            vz = abs(descent_speed)
-                elif flight_phase == "landed":
-                    if not test_mode:
-                        cut_throttle(vehicle, log, 0.1)
-                    break
-            else:
-                centered_start_time = None
-                if flight_phase == "descending":
-                    # Keep position and wait for detection/prediction again.
-                    vz = 0.0
+            # ---------- LAND CHECK ----------
+            if alt <= landing_alt:
+                log.info("Landing complete.")
+                cut_throttle(vehicle, log, 0.1)
+                break
 
-            if flight_phase == "descending" and current_alt <= 0.3:
-                log.info("FORCE LAND")
-                flight_phase = "landed"
-                continue
+            # ---------- SEND COMMAND ----------
+            send_velocity(vehicle, log, vx, vy, vz)
 
-            if not test_mode:
-                send_velocity(vehicle, log, vx, vy, vz)
-            else:
-                if flight_phase == "descending":
-                    simulated_alt -= vz * (duty_cycle / 1000.0)
-                    if simulated_alt <= landing_alt:
-                        simulated_alt = landing_alt
-                        flight_phase = "landed"
-                if unity_drone_sock is not None:
-                    send_velocity_to_unity(unity_drone_sock, vx, vy, vz)
+            # ---------- LOG TO EXCEL ----------
+            sheet.append([
+                datetime.now().isoformat(),
+                round(now - start_time, 3),
+                round(float(alt), 4),
+                "" if x_raw is None else round(float(x_raw), 6),
+                "" if y_raw is None else round(float(y_raw), 6),
+                "" if x_est is None else round(float(x_est), 6),
+                "" if y_est is None else round(float(y_est), 6),
+                "" if np.isnan(x_error) else round(float(x_error), 6),
+                "" if np.isnan(y_error) else round(float(y_error), 6),
+                round(float(vx), 6),
+                round(float(vy), 6),
+                round(float(vz), 6),
+                int(centered),
+            ])
 
-            if now - log_timer_start >= log_time_delay:
-                log.debug(
-                    "PHASE=%s SRC=%s ALT=%.2f V=(%.3f,%.3f,%.3f)",
-                    flight_phase,
-                    tracking_source,
-                    current_alt,
-                    vx,
-                    vy,
-                    vz,
-                )
-                log_timer_start = now
-
-            sheet.append(
-                [
-                    datetime.now().isoformat(),
-                    round(now - start_time, 3),
-                    flight_phase,
-                    tracking_source,
-                    int(detection_valid),
-                    round(float(current_alt), 4),
-                    "" if x_raw is None else round(float(x_raw), 6),
-                    "" if y_raw is None else round(float(y_raw), 6),
-                    "" if x_est is None else round(float(x_est), 6),
-                    "" if y_est is None else round(float(y_est), 6),
-                    "" if np.isnan(x_error) else round(float(x_error), 6),
-                    "" if np.isnan(y_error) else round(float(y_error), 6),
-                    round(float(vx), 6),
-                    round(float(vy), 6),
-                    round(float(vz), 6),
-                    int(centered),
-                    int(ready_to_descend),
-                ]
-            )
-            if now - last_xlsx_save >= 1.0:
+            if now - last_save >= 1.0:
                 workbook.save(NUMERIC_LOG_PATH)
-                last_xlsx_save = now
+                last_save = now
 
             time.sleep(duty_cycle / 1000.0)
+
     finally:
         workbook.save(NUMERIC_LOG_PATH)
-        if not test_mode and previous_wp_behaviour is not None:
-            vehicle.parameters["WP_YAW_BEHAVIOR"] = previous_wp_behaviour
-        log.info("Saved numeric telemetry to: %s", NUMERIC_LOG_PATH)
-        log.info("Done")
-
+        log.info("Saved telemetry to %s", NUMERIC_LOG_PATH)
 
 def main() -> None:
     os.makedirs("logs", exist_ok=True)
